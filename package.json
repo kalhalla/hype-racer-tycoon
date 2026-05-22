@@ -1,0 +1,12 @@
+{
+  "name": "hype-racer-tycoon",
+  "private": true,
+  "type": "module",
+  "description": "Single-file Three.js racer. The game is public/index.html (no build step); /api holds the leaderboard serverless function.",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0"
+  }
+}
