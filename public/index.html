@@ -401,9 +401,41 @@ button.primary.go:active { transform: skewX(-10deg) translate(3px, 3px); box-sha
 #podium-banner .pb-best { display: none; margin-top: 6px; background: var(--coin); color: var(--hype-black-deep); padding: 3px 12px; border-radius: 6px; font-size: 14px; letter-spacing: 2px; }
 #podium-banner .pb-best.show { display: inline-block; animation: pbpulse 0.7s ease-in-out infinite alternate; }
 @keyframes pbpulse { from { transform: scale(1); } to { transform: scale(1.08); } }
+
+/* Big always-on mute button — brand CTA styling (black, green, deep-green offset) */
+.mute-fab {
+  position: fixed; top: 80px; right: 14px; z-index: 9999;
+  width: 60px; height: 60px; border-radius: 50%;
+  background: var(--hype-black); border: 2px solid var(--hype-green);
+  box-shadow: 5px 5px 0 var(--hype-green-deep);
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; padding: 0; -webkit-tap-highlight-color: transparent;
+}
+.mute-fab:active { transform: translate(3px, 3px); box-shadow: 2px 2px 0 var(--hype-green-deep); }
+.mute-fab svg { width: 32px; height: 32px; fill: var(--hype-green); }
+.mute-fab.muted { border-color: #666; box-shadow: 5px 5px 0 #333; }
+.mute-fab.muted svg { fill: #888; }
+@media (max-width: 600px) { .mute-fab { width: 52px; height: 52px; top: 72px; } .mute-fab svg { width: 28px; height: 28px; } }
+
+/* Damage warning banner — fades in on a wing loss, auto-hides */
+#damage-warning {
+  position: fixed; top: 24%; left: 50%; transform: translateX(-50%) translateY(-8px);
+  z-index: 9998; pointer-events: none; white-space: nowrap; text-align: center;
+  background: var(--hype-black); color: #ff5a3c;
+  border: 2px solid #ff5a3c; box-shadow: 5px 5px 0 #7a1d10;
+  font-family: 'Anton', sans-serif; text-transform: uppercase; letter-spacing: 1px;
+  font-size: 20px; padding: 12px 22px; border-radius: 8px;
+  opacity: 0; transition: opacity 0.25s, transform 0.25s;
+}
+#damage-warning.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+@media (max-width: 600px) { #damage-warning { font-size: 14px; padding: 9px 13px; white-space: normal; max-width: 80vw; } }
 </style>
 </head>
 <body>
+<button class="mute-fab" id="btn-mute-big" title="Toggle sound" aria-label="Toggle sound">
+  <svg id="mute-icon-big" viewBox="0 0 24 24"></svg>
+</button>
+<div id="damage-warning"></div>
 
 <div id="canvas-container"></div>
 
@@ -764,6 +796,10 @@ const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+// ACES gives the strong sun room to roll off instead of hard-clipping to white,
+// so lit surfaces read as bright sunlight while keeping their colour.
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.3;
 container.appendChild(renderer.domElement);
 
 const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 200);
@@ -777,16 +813,23 @@ function resize() {
 window.addEventListener('resize', resize);
 resize();
 
-const hemi = new THREE.HemisphereLight(0xfff4d6, 0xb88c4a, 0.75);
+// Provençal midday: a strong warm sun for crisp, dark shadows, lifted by a
+// bright sky fill. The sun-to-fill ratio is what makes shadows read as strong;
+// ACES tone mapping (on the renderer) keeps the bright lit surfaces from
+// blowing out to flat white as the intensities climb.
+const hemi = new THREE.HemisphereLight(0xfff6e2, 0xc79a5e, 1.15);
 scene.add(hemi);
-const sun = new THREE.DirectionalLight(0xfff2cc, 1.1);
-sun.position.set(8, 18, 6);
+const sun = new THREE.DirectionalLight(0xfff3da, 2.7);
+sun.position.set(9, 16, 7);
 sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048);
 sun.shadow.camera.left = -22; sun.shadow.camera.right = 22;
 sun.shadow.camera.top = 22; sun.shadow.camera.bottom = -22;
 sun.shadow.camera.near = 1; sun.shadow.camera.far = 50;
+sun.shadow.bias = -0.0004;     // trims shadow acne now that contrast is higher
+sun.shadow.normalBias = 0.02;
 scene.add(sun);
+scene.add(sun.target);   // target must be in the scene graph for shadow-follow
 
 // Ground
 const ground = new THREE.Mesh(
@@ -796,6 +839,144 @@ const ground = new THREE.Mesh(
 ground.rotation.x = -Math.PI / 2;
 ground.receiveShadow = true;
 scene.add(ground);
+
+/* =====================================================
+   TYRE SMOKE — pooled camera-facing sprites, no external assets.
+   A soft puff texture is painted to a canvas at load; lock-ups spawn puffs
+   that rise, drift, swell and fade. Pool recycling keeps it allocation-free.
+===================================================== */
+const smoke = (() => {
+  const cnv = document.createElement('canvas'); cnv.width = cnv.height = 64;
+  const g = cnv.getContext('2d');
+  const grad = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  grad.addColorStop(0.0, 'rgba(255,255,255,0.9)');
+  grad.addColorStop(0.4, 'rgba(244,244,244,0.5)');
+  grad.addColorStop(1.0, 'rgba(228,228,228,0)');
+  g.fillStyle = grad; g.fillRect(0, 0, 64, 64);
+  const tex = new THREE.CanvasTexture(cnv);
+
+  const POOL = 100;
+  const pool = [];
+  for (let i = 0; i < POOL; i++) {
+    const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, opacity: 0, depthWrite: false }));
+    s.visible = false;
+    scene.add(s);
+    pool.push(s);
+  }
+  let cur = 0;
+
+  function puff(x, y, z) {
+    const s = pool[cur]; cur = (cur + 1) % POOL;
+    s.visible = true;
+    s.position.set(x, y, z);
+    s.scale.setScalar(0.28 + Math.random() * 0.28);
+    const life = 0.5 + Math.random() * 0.4;
+    s.userData.life = life; s.userData.maxLife = life;
+    s.userData.vx = (Math.random() - 0.5) * 0.9;
+    s.userData.vy = 0.55 + Math.random() * 0.5;
+    s.userData.vz = (Math.random() - 0.5) * 0.9;
+    s.userData.grow = 1.7 + Math.random() * 1.3;
+    s.material.opacity = 0.5;
+  }
+
+  function update(dt) {
+    for (const s of pool) {
+      if (!s.visible) continue;
+      s.userData.life -= dt;
+      if (s.userData.life <= 0) { s.visible = false; s.material.opacity = 0; continue; }
+      s.position.x += s.userData.vx * dt;
+      s.position.y += s.userData.vy * dt;
+      s.position.z += s.userData.vz * dt;
+      s.userData.vy *= (1 - dt * 0.5);
+      s.scale.setScalar(s.scale.x + s.userData.grow * dt);
+      s.material.opacity = 0.5 * (s.userData.life / s.userData.maxLife);
+    }
+  }
+  return { puff, update };
+})();
+let smokeIdx = 0, skidTimer = 0, skidFrame = 0, skidWasActive = false;
+
+/* =====================================================
+   DAMAGE — detachable wings + debris.
+   Front wing: lost on a hard frontal hit or 4 small frontal knocks; grip halves.
+   Rear wing: lost on a hard rear hit; the back end goes loose (more oversteer).
+   The lost wing reparents to the world and tumbles to the track.
+===================================================== */
+const debris = [];
+const damageWarnEl = document.getElementById('damage-warning');
+let damageWarnTimer = null;
+function showDamageWarning(text) {
+  if (!damageWarnEl) return;
+  damageWarnEl.textContent = text;
+  damageWarnEl.classList.add('show');
+  clearTimeout(damageWarnTimer);
+  damageWarnTimer = setTimeout(() => damageWarnEl.classList.remove('show'), 3000);
+}
+function isFrontContact(r, cx, cz) {
+  const fwx = -Math.sin(r.heading), fwz = Math.cos(r.heading);
+  return (cx - r.position.x) * fwx + (cz - r.position.z) * fwz >= 0;
+}
+function detachWing(car, which) {
+  const wing = which === 'front' ? car.mesh.userData.frontWing : car.mesh.userData.rearWing;
+  if (!wing || wing.parent !== car.mesh) return;
+  car.mesh.updateMatrixWorld(true);
+  const wp = new THREE.Vector3(), wq = new THREE.Quaternion();
+  wing.getWorldPosition(wp); wing.getWorldQuaternion(wq);
+  scene.add(wing);                       // reparents to world (removes from the car)
+  wing.position.copy(wp); wing.quaternion.copy(wq);
+  const fx = -Math.sin(car.heading), fz = Math.cos(car.heading);
+  debris.push({
+    obj: wing,
+    vx: -fx * (1.5 + Math.random()) + (Math.random() - 0.5) * 2,
+    vy: 2.6 + Math.random() * 1.6,
+    vz: -fz * (1.5 + Math.random()) + (Math.random() - 0.5) * 2,
+    sx: (Math.random() - 0.5) * 12, sy: (Math.random() - 0.5) * 12, sz: (Math.random() - 0.5) * 12,
+    life: 3.5
+  });
+}
+function updateDebris(dt) {
+  for (let i = debris.length - 1; i >= 0; i--) {
+    const d = debris[i];
+    d.vy -= 12 * dt;
+    d.obj.position.x += d.vx * dt; d.obj.position.y += d.vy * dt; d.obj.position.z += d.vz * dt;
+    d.obj.rotation.x += d.sx * dt; d.obj.rotation.y += d.sy * dt; d.obj.rotation.z += d.sz * dt;
+    if (d.obj.position.y < 0.06) {        // settle on the track
+      d.obj.position.y = 0.06; d.vy = 0; d.vx *= 0.5; d.vz *= 0.5;
+      d.sx *= 0.4; d.sy *= 0.4; d.sz *= 0.4;
+    }
+    d.life -= dt;
+    if (d.life <= 0) { scene.remove(d.obj); debris.splice(i, 1); }
+  }
+}
+function loseFrontWing(pc) {
+  if (pc.frontWingGone) return;
+  pc.frontWingGone = true;
+  pc.gripMul = 0.5;                       // front downforce gone → grip halved
+  detachWing(pc, 'front');
+  audio.impact(0.6);
+  showDamageWarning('Front wing damage - loss of front grip');
+}
+function loseRearWing(pc) {
+  if (pc.rearWingGone) return;
+  pc.rearWingGone = true;
+  pc.rearLoose = true;                    // rear downforce gone → snappier oversteer
+  detachWing(pc, 'rear');
+  audio.impact(0.6);
+  showDamageWarning('Rear wing damage - loose rear end');
+}
+function registerDamage(severity, isFront) {
+  const pc = playerCar;
+  if (!pc || !pc.isPlayer) return;
+  if ((pc.dmgCooldown || 0) > 0) return;  // one damage event per ~0.5s, whatever the source
+  pc.dmgCooldown = 0.5;
+  const HARD = 0.8;
+  if (isFront) {
+    if (severity >= HARD) loseFrontWing(pc);
+    else { pc.frontHits = (pc.frontHits || 0) + 1; if (pc.frontHits >= 4) loseFrontWing(pc); }
+  } else if (severity >= HARD) {
+    loseRearWing(pc);
+  }
+}
 
 /* =====================================================
    TRACK — vertical oblong with elevated bridge section
@@ -1188,8 +1369,8 @@ const TUNNEL_T_END   = TUNNEL ? TUNNEL.tEnd   : 0;
 function buildTunnel() {
   if (!TUNNEL) return new THREE.Group();
   const group = new THREE.Group();
-  const ceilMat = new THREE.MeshLambertMaterial({ color: 0x3a3530, side: THREE.DoubleSide });
-  const wallMat = new THREE.MeshLambertMaterial({ color: 0x4a4540 });
+  const ceilMat = new THREE.MeshLambertMaterial({ color: 0x141210, side: THREE.DoubleSide });
+  const wallMat = new THREE.MeshLambertMaterial({ color: 0x1d1a16 });
   const outerMat = new THREE.MeshLambertMaterial({ color: 0x6b5a4a });  // warmer beige for the outside mass
   const W = TRACK_WIDTH + 0.4;
   const W_OUTER = W + 1.6;      // outer wall offset — gives the tunnel block thickness
@@ -2291,52 +2472,55 @@ function createCar(color) {
   group.add(head);
 
   // === FRONT WING ===
-  const fw = new THREE.Mesh(new THREE.BoxGeometry(0.40, 0.04, 0.08), bodyMat);
-  fw.position.set(0, 0.10, 0.50);
-  fw.castShadow = true;
-  group.add(fw);
-  for (const sx of [-0.18, 0.18]) {
-    const ep = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.10, 0.10), bodyMat);
-    ep.position.set(sx, 0.13, 0.50);
-    group.add(ep);
+  const fwGroup = new THREE.Group();   // grouped so damage can fling the whole wing off
+  const fw = new THREE.Mesh(new THREE.BoxGeometry(0.56, 0.05, 0.16), bodyMat);
+  fw.position.set(0, 0.09, 0.52); fw.castShadow = true; fwGroup.add(fw);
+  const fwFlap = new THREE.Mesh(new THREE.BoxGeometry(0.50, 0.035, 0.10), bodyMat);
+  fwFlap.position.set(0, 0.135, 0.47); fwFlap.castShadow = true; fwGroup.add(fwFlap);
+  for (const sx of [-0.27, 0.27]) {
+    const ep = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.15, 0.20), bodyMat);
+    ep.position.set(sx, 0.135, 0.50); ep.castShadow = true; fwGroup.add(ep);
   }
+  group.add(fwGroup);
+  group.userData.frontWing = fwGroup;
 
   // === REAR WING ===
+  const rwGroup = new THREE.Group();
   for (const sx of [-0.10, 0.10]) {
     const post = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.18, 0.04), darkMat);
-    post.position.set(sx, 0.36, -0.38);
-    group.add(post);
+    post.position.set(sx, 0.36, -0.38); rwGroup.add(post);
   }
   const rw = new THREE.Mesh(new THREE.BoxGeometry(0.40, 0.04, 0.12), bodyMat);
-  rw.position.set(0, 0.44, -0.38);
-  rw.castShadow = true;
-  group.add(rw);
+  rw.position.set(0, 0.44, -0.38); rw.castShadow = true; rwGroup.add(rw);
   for (const sx of [-0.20, 0.20]) {
     const ep = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.14, 0.14), bodyMat);
-    ep.position.set(sx, 0.40, -0.38);
-    group.add(ep);
+    ep.position.set(sx, 0.40, -0.38); rwGroup.add(ep);
   }
+  group.add(rwGroup);
+  group.userData.rearWing = rwGroup;
 
-  // === WHEELS === (fat tyres with contrasting rims; front wheels steer independently)
-  const tireGeom = new THREE.CylinderGeometry(0.12, 0.12, 0.10, 12);
-  tireGeom.rotateZ(Math.PI / 2);
-  const rimGeom = new THREE.CylinderGeometry(0.07, 0.07, 0.11, 8);
-  rimGeom.rotateZ(Math.PI / 2);
+  // === WHEELS === front tyres standard; rear tyres bigger and wider for rake.
+  const frontTire = new THREE.CylinderGeometry(0.12, 0.12, 0.10, 14); frontTire.rotateZ(Math.PI / 2);
+  const frontRim  = new THREE.CylinderGeometry(0.07, 0.07, 0.11, 8);  frontRim.rotateZ(Math.PI / 2);
+  const rearTire  = new THREE.CylinderGeometry(0.20, 0.20, 0.20, 16); rearTire.rotateZ(Math.PI / 2);
+  const rearRim   = new THREE.CylinderGeometry(0.12, 0.12, 0.21, 8);  rearRim.rotateZ(Math.PI / 2);
 
+  // [x, y, z, isFront]; rear y is raised to the bigger radius so it sits flat.
   const wheelPositions = [
-    [ 0.26, 0.12,  0.26],
-    [-0.26, 0.12,  0.26],
-    [ 0.26, 0.12, -0.24],
-    [-0.26, 0.12, -0.24]
+    [ 0.26, 0.12,  0.26, true],
+    [-0.26, 0.12,  0.26, true],
+    [ 0.26, 0.20, -0.24, false],
+    [-0.26, 0.20, -0.24, false]
   ];
 
   group.userData.wheels = [];
   group.userData.frontWheels = [];
-  for (const [x, y, z] of wheelPositions) {
-    const tire = new THREE.Mesh(tireGeom, darkMat);
-    const rim = new THREE.Mesh(rimGeom, rimMat);
+  group.userData.rearWheels = [];
+  for (const [x, y, z, isFront] of wheelPositions) {
+    const tire = new THREE.Mesh(isFront ? frontTire : rearTire, darkMat);
+    const rim  = new THREE.Mesh(isFront ? frontRim  : rearRim,  rimMat);
     tire.castShadow = true;
-    if (z > 0) {
+    if (isFront) {
       // Front wheel: nested in a yaw group so steering angle is independent of roll
       const steerGroup = new THREE.Group();
       steerGroup.position.set(x, y, z);
@@ -2349,10 +2533,31 @@ function createCar(color) {
       rim.position.set(x, y, z);
       group.add(tire);
       group.add(rim);
+      group.userData.rearWheels.push(tire);
+      group.userData.rearWheels.push(rim);
     }
     group.userData.wheels.push(tire);
     group.userData.wheels.push(rim);
   }
+
+  // === REAR DIFFUSER === a big dark upswept Venturi diffuser with vertical
+  // strakes plus a dark gearbox mass — together they make the tail read dark.
+  const diffMat = new THREE.MeshLambertMaterial({ color: 0x0d0d0d });
+  const diffuser = new THREE.Mesh(new THREE.BoxGeometry(0.46, 0.17, 0.22), diffMat);
+  diffuser.position.set(0, 0.12, -0.46);
+  diffuser.rotation.x = 0.4;            // upswept ramp: trailing edge lifts at the rear
+  diffuser.castShadow = true;
+  group.add(diffuser);
+  for (const sx of [-0.18, -0.09, 0, 0.09, 0.18]) {
+    const fin = new THREE.Mesh(new THREE.BoxGeometry(0.02, 0.18, 0.24), diffMat);
+    fin.position.set(sx, 0.13, -0.46);
+    fin.rotation.x = 0.4;
+    group.add(fin);
+  }
+  const tail = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.17, 0.18), diffMat);
+  tail.position.set(0, 0.18, -0.33);
+  tail.castShadow = true;
+  group.add(tail);
 
   return group;
 }
@@ -2405,7 +2610,10 @@ function setupRace() {
       splineProgress: ((splineStart % 1) + 1) % 1,
       roll: 0, targetRoll: 0,
       steerWheelAngle: 0,
-      collisionCooldown: 0
+      collisionCooldown: 0,
+      dmgCooldown: 0,
+      frontHits: 0, frontWingGone: false, rearWingGone: false,
+      gripMul: 1, rearLoose: false
     }, extras);
   }
 
@@ -2414,13 +2622,13 @@ function setupRace() {
   scene.add(pMesh);
   playerCar = initRacer(pMesh, 0, 0, true, {
     color: playerColor,
-    maxSpeed: 6.51 * upgradeMult('speed'), // base cut 30% from 9.3 so speed upgrades matter
+    maxSpeed: 11.0 * upgradeMult('speed'), // higher top speed; corners demand braking
     handling: upgradeMult('handling')
   });
   racers.push(playerCar);
 
   // AI: difficulty scales gently with level (world units / sec)
-  const aiBase = 8.6 + Math.min(1.8, state.level * 0.3);
+  const aiBase = 12.0 + Math.min(2.0, state.level * 0.3);
   const otherFlavours = FLAVOURS.filter((_, i) => i !== state.carFlavour);
   const aiOffsets = [-0.6, 0.6, -0.3];
   for (let i = 0; i < 3; i++) {
@@ -2445,7 +2653,10 @@ function positionCar(r) {
   r.mesh.rotation.z = r.roll || 0;
   // Spin wheels in proportion to forward speed (world-units/sec)
   if (r.mesh.userData.wheels) {
-    for (const w of r.mesh.userData.wheels) w.rotation.x += r.speed * 0.05;
+    for (const w of r.mesh.userData.wheels) w.rotation.x += (r.lockedUp ? 0 : r.speed) * 0.05;
+    if (r.wheelspin && r.mesh.userData.rearWheels) {           // rears spin far faster than the car moves
+      for (const w of r.mesh.userData.rearWheels) w.rotation.x += 0.45;
+    }
   }
   // Steer front wheels (cosmetic)
   const sw = r.steerWheelAngle || 0;
@@ -2496,24 +2707,33 @@ function setupTouchControls() {
 setupTouchControls();
 
 /* =====================================================
-   AUDIO  (Web Audio synthesis — no external assets)
-   Engine: two detuned sawtooths + lowpass-filtered noise. Frequency tracks
-   playerCar.speed; filter cutoff opens with throttle. Screech triggers from
-   inside tick() when steering hard at speed. Impact is a sine thump + noise
-   crunch scaled by severity. Beep is a square envelope for the countdown.
+   AUDIO  (fully procedural Web Audio — no external assets)
+   Engine: a custom-spectrum oscillator + detuned twin (beating) + half-order
+   sub (lumpy rumble) + noise turbulence, summed through a throttle-driven
+   lowpass. The rise-and-fall at steady RPM comes from the half-order sub and a
+   gentle detune beat. Firing fundamental tracks playerCar.speed.
+   Screech triggers from inside tick() on hard steering at speed. Impact is a
+   sine thump + noise crunch scaled by severity. Beep is a square countdown.
 ===================================================== */
-const ENGINE_LOOP_MP3 = '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VVVVVVVVVVVVVVVVVVX/8+DEAAAAA0gBwAAATEFNRTMuMTAwVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVMQU1FMy4xMDBVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=';
 
 const audio = (() => {
   let ctx = null, master = null;
-  let engineBuffer = null;
-  let engineSrc = null, engineGain = null, engineFilter = null;
   let noiseBuffer = null;
+  // Engine voice nodes — rebuilt on each engineOn (oscillators are one-shot).
+  let osc = null, oscB = null, subOsc = null;
+  let toneGain = null, noiseSrc = null, noiseBP = null,
+      noiseGain = null, lowpass = null, engineGain = null;
+  let engineWave = null;
+  let skidSrc = null, skidBP = null, skidLfo = null, skidGain = null;   // sustained tyre-skid voice
   let engineState = 'off';
-  let pendingEngineOn = false;
   let screechCooldown = 0;
-  let smoothedRate = 0.6;
+  let smoothedFreq = 90;   // firing fundamental (Hz), smoothed toward the RPM target
   let muted = false;
+
+  // Idle / redline firing fundamentals and the speed that maps to redline. A
+  // fully speed-upgraded car (maxSpeed ~9.3) sits near redline; a base car tops
+  // out partway up the range, so speed upgrades audibly let the engine rev higher.
+  const IDLE_HZ = 90, REDLINE_HZ = 480, REV_REF = 11;   // deeper firing range
 
   function makeNoiseBuffer(c) {
     const len = c.sampleRate * 2;
@@ -2521,6 +2741,20 @@ const audio = (() => {
     const d = buf.getChannelData(0);
     for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
     return buf;
+  }
+
+  // Engine timbre as a harmonic spectrum: 1/n rolloff with a formant bump near
+  // the 4th harmonic so it reads as a throaty exhaust note, not a buzzer, and
+  // stays audible on phone speakers that can't reproduce the low fundamental.
+  function makeEngineWave(c) {
+    const N = 14;
+    const real = new Float32Array(N), imag = new Float32Array(N);
+    for (let n = 1; n < N; n++) {
+      let a = 1 / n;                                              // steeper rolloff → less top-end whine
+      a *= 1 + 0.8 * Math.exp(-Math.pow((n - 3) / 2.6, 2));       // lower formant → throaty, not shrill
+      imag[n] = a;
+    }
+    return c.createPeriodicWave(real, imag, { disableNormalization: false });
   }
 
   function ensureCtx() {
@@ -2532,26 +2766,9 @@ const audio = (() => {
     master.gain.value = muted ? 0 : 0.85;
     master.connect(ctx.destination);
     noiseBuffer = makeNoiseBuffer(ctx);
-    loadEngineBuffer();
+    engineWave = makeEngineWave(ctx);
+    buildSkidVoice();
     return ctx;
-  }
-
-  // Decode the embedded MP3 loop into an AudioBuffer. Async; if engineOn fires
-  // before the decode lands, pendingEngineOn flag re-runs it on completion.
-  function loadEngineBuffer() {
-    if (!ctx || engineBuffer) return;
-    const binStr = atob(ENGINE_LOOP_MP3);
-    const bytes = new Uint8Array(binStr.length);
-    for (let i = 0; i < binStr.length; i++) bytes[i] = binStr.charCodeAt(i);
-    ctx.decodeAudioData(bytes.buffer)
-      .then(buf => {
-        engineBuffer = buf;
-        if (pendingEngineOn) {
-          pendingEngineOn = false;
-          engineOn();
-        }
-      })
-      .catch(err => console.warn('engine decode failed:', err));
   }
 
   // Must be called from inside a user-gesture handler. Idempotent.
@@ -2561,93 +2778,161 @@ const audio = (() => {
     if (c.state === 'suspended') c.resume();
   }
 
+  // Build the full engine voice. Three tonal oscillators (engine wave, detuned
+  // twin, half-order sub) plus a noise turbulence layer, summed through a
+  // throttle-driven lowpass. Rise-and-fall at steady RPM comes from the half-
+  // order sub and a gentle detune beat; a periodic LFO tremolo read as a
+  // mechanical clap, so the movement lives in the pulses, not a gain wobble.
   function buildEngine() {
-    if (!ctx || engineSrc || !engineBuffer) return;
-    // Looping sample source — pitch (playbackRate) is driven by speed in tick().
-    engineSrc = ctx.createBufferSource();
-    engineSrc.buffer = engineBuffer;
-    engineSrc.loop = true;
-    engineSrc.playbackRate.value = 0.6;
+    if (!ctx || osc || !engineWave) return;
+    const t = ctx.currentTime;
+    const f = smoothedFreq;
 
-    // Lowpass adds throttle-driven brightness on top of the recording's natural
-    // shape. Q kept low — the recording already has plenty of character.
-    engineFilter = ctx.createBiquadFilter();
-    engineFilter.type = 'lowpass';
-    engineFilter.frequency.value = 1400;
-    engineFilter.Q.value = 0.8;
+    osc = ctx.createOscillator();
+    osc.setPeriodicWave(engineWave);
+    osc.frequency.value = f;
+
+    oscB = ctx.createOscillator();
+    oscB.setPeriodicWave(engineWave);
+    oscB.frequency.value = f;
+    oscB.detune.value = 3;             // tiny beat → faint shimmer, no metallic clap
+
+    subOsc = ctx.createOscillator();
+    subOsc.type = 'sine';
+    subOsc.frequency.value = f * 0.5;  // half-order lump
+
+    const oscG = ctx.createGain();  oscG.gain.value = 1.0;
+    const oscBG = ctx.createGain(); oscBG.gain.value = 0.4;
+    const subG = ctx.createGain();  subG.gain.value = 0.5;   // more half-order octave for body
+
+    toneGain = ctx.createGain();
+    toneGain.gain.value = 0.5;
+
+    noiseSrc = ctx.createBufferSource();
+    noiseSrc.buffer = noiseBuffer;
+    noiseSrc.loop = true;
+    noiseBP = ctx.createBiquadFilter();
+    noiseBP.type = 'bandpass';
+    noiseBP.frequency.value = 500;
+    noiseBP.Q.value = 0.9;
+    noiseGain = ctx.createGain();
+    noiseGain.gain.value = 0.05;   // intake/exhaust air
+
+    lowpass = ctx.createBiquadFilter();
+    lowpass.type = 'lowpass';
+    lowpass.frequency.value = 700;
+    lowpass.Q.value = 0.8;
 
     engineGain = ctx.createGain();
     engineGain.gain.value = 0;
 
-    engineSrc.connect(engineFilter).connect(engineGain).connect(master);
-    engineSrc.start();
+    osc.connect(oscG).connect(toneGain);
+    oscB.connect(oscBG).connect(toneGain);
+    subOsc.connect(subG).connect(toneGain);
+    toneGain.connect(lowpass);
+    noiseSrc.connect(noiseBP).connect(noiseGain).connect(lowpass);
+    lowpass.connect(engineGain).connect(master);
+
+    osc.start(t); oscB.start(t); subOsc.start(t); noiseSrc.start(t);
   }
 
   function engineOn() {
     if (!ctx) return;
-    // Buffer may not have decoded yet (race vs first user gesture). Defer.
-    if (!engineBuffer) {
-      pendingEngineOn = true;
-      return;
-    }
     buildEngine();
     engineState = 'on';
     engineGain.gain.cancelScheduledValues(ctx.currentTime);
-    engineGain.gain.setTargetAtTime(0.38, ctx.currentTime, 0.15);
+    engineGain.gain.setTargetAtTime(0.24, ctx.currentTime, 0.15);   // sits under the skid/impact FX
   }
 
   function engineOff() {
-    pendingEngineOn = false;
     if (!ctx || !engineGain) return;
     engineState = 'off';
     const t = ctx.currentTime;
     engineGain.gain.cancelScheduledValues(t);
     engineGain.gain.setTargetAtTime(0, t, 0.35);
-    // Stop the BufferSource after the fade so it doesn't loop silently forever.
-    // Null the refs so next engineOn creates a fresh source/filter/gain chain.
-    const srcRef = engineSrc;
-    engineSrc = null;
-    engineFilter = null;
-    engineGain = null;
-    if (srcRef) {
-      try { srcRef.stop(t + 1.2); } catch (e) {}
-    }
+    // Stop every source after the fade, then null refs so the next engineOn
+    // rebuilds a fresh voice (oscillators can't be restarted once stopped).
+    const stopAt = t + 1.2;
+    [osc, oscB, subOsc, noiseSrc].forEach(n => { if (n) { try { n.stop(stopAt); } catch (e) {} } });
+    osc = oscB = subOsc = null;
+    toneGain = noiseSrc = noiseBP = noiseGain = lowpass = engineGain = null;
   }
 
-  // Per-frame engine update. playbackRate scales the sample's pitch; the
-  // recording at 1.0x is the high-RPM scream from the source file. 0.6x is
-  // approx idle. Filter cutoff tracks throttle for engine-braking feel.
+  // Per-frame update. Speed sets the firing fundamental (idle→redline), smoothed
+  // for inertia; the filters open and the noise brightens with RPM/throttle.
   function tick(dt, speed, throttling, steerMag) {
-    if (!ctx || engineState !== 'on' || !engineSrc) return;
-    const targetRate = 0.6 + Math.min(1, speed / 10) * 0.65;  // 0.6 → 1.25
-    smoothedRate += (targetRate - smoothedRate) * Math.min(1, dt * 6);
+    if (!ctx || engineState !== 'on' || !osc) return;
+    let rpm = Math.min(1, Math.max(0, speed / REV_REF));
+    // Launch rev: with the throttle open at low road speed the engine still
+    // spins up (clutch slip / wheelspin), so the note climbs even when the car
+    // isn't moving yet. Fades out by ~speed 6, kept monotonic into the speed map.
+    if (throttling) rpm = Math.min(1, rpm + Math.max(0, 1 - speed / 6) * 0.4 + 0.08);
+    else rpm *= 0.8;   // off-throttle overrun: revs sag below road speed so a lift is heard at once
+    const targetFreq = IDLE_HZ + (REDLINE_HZ - IDLE_HZ) * rpm;
+    smoothedFreq += (targetFreq - smoothedFreq) * Math.min(1, dt * 9);   // snappier throttle response
     const t = ctx.currentTime;
-    engineSrc.playbackRate.setValueAtTime(smoothedRate, t);
-    const cutTarget = throttling ? 5500 : 1300;
-    engineFilter.frequency.setTargetAtTime(cutTarget, t, 0.06);
-    screechCooldown -= dt;
-    if (steerMag > 0.7 && speed > 6 && screechCooldown <= 0) {
-      screech();
-      screechCooldown = 0.4;
-    }
+    const f = smoothedFreq;
+    osc.frequency.setTargetAtTime(f, t, 0.04);
+    oscB.frequency.setTargetAtTime(f, t, 0.04);
+    subOsc.frequency.setTargetAtTime(f * 0.5, t, 0.04);
+    const cut = 700 + rpm * 4100 + (throttling ? 1500 : 0);   // tamer ceiling → deeper, less drill
+    lowpass.frequency.setTargetAtTime(cut, t, 0.06);
+    noiseBP.frequency.setTargetAtTime(350 + rpm * 2000, t, 0.08);
+    noiseGain.gain.setTargetAtTime(0.05 + rpm * 0.05 + (throttling ? 0.05 : 0), t, 0.08);
+    // Skid sound is driven from the game loop now (lockup, oversteer, front
+    // understeer and launch wheelspin all share one skid trigger there).
   }
 
-  function screech() {
+  // Sustained tyre-skid voice: a looping band-passed noise bed (the "long
+  // screech"), held at zero gain and opened by setSkid(). A slow LFO wavers the
+  // centre frequency so it wails rather than hissing flatly. Built once.
+  function buildSkidVoice() {
+    skidSrc = ctx.createBufferSource();
+    skidSrc.buffer = noiseBuffer;
+    skidSrc.loop = true;
+    skidBP = ctx.createBiquadFilter();
+    skidBP.type = 'bandpass';
+    skidBP.frequency.value = 1400;
+    skidBP.Q.value = 1.6;     // wide band → broadband scrub, not a pure whistle
+    skidLfo = ctx.createOscillator();
+    skidLfo.type = 'sine';
+    skidLfo.frequency.value = 4.5;
+    const lg = ctx.createGain();
+    lg.gain.value = 150;                 // gentler waver (less whistle wobble)
+    skidLfo.connect(lg).connect(skidBP.frequency);
+    skidGain = ctx.createGain();
+    skidGain.gain.value = 0;
+    skidSrc.connect(skidBP).connect(skidGain).connect(master);
+    skidSrc.start();
+    skidLfo.start();
+  }
+
+  // Hold the long screech on/off. heavy = louder (lock-up / wingless front scrub).
+  function setSkid(on, heavy) {
+    if (!ctx || !skidGain) return;
+    const t = ctx.currentTime;
+    skidGain.gain.setTargetAtTime(on ? (heavy ? 0.28 : 0.18) : 0, t, on ? 0.04 : 0.12);
+  }
+
+  // Short rising tonal "chirp" — a tyre scrub squeal layered over the screech.
+  function chirp() {
     if (!ctx) return;
     const t = ctx.currentTime;
     const src = ctx.createBufferSource();
     src.buffer = noiseBuffer;
     const bp = ctx.createBiquadFilter();
     bp.type = 'bandpass';
-    bp.frequency.value = 3500;
-    bp.Q.value = 6;
+    bp.Q.value = 5;                      // scrubby squeal, not a pure whistle
+    const f0 = 1200 + Math.random() * 400;
+    bp.frequency.setValueAtTime(f0, t);
+    bp.frequency.linearRampToValueAtTime(f0 + 600, t + 0.07);   // quick rise = chirp
     const g = ctx.createGain();
     g.gain.value = 0;
-    g.gain.setTargetAtTime(0.09, t, 0.01);
-    g.gain.setTargetAtTime(0, t + 0.06, 0.08);
+    g.gain.setTargetAtTime(0.32, t, 0.005);
+    g.gain.setTargetAtTime(0, t + 0.04, 0.04);
     src.connect(bp).connect(g).connect(master);
     src.start(t);
-    src.stop(t + 0.35);
+    src.stop(t + 0.2);
   }
 
   // severity: 0..1
@@ -2701,7 +2986,7 @@ const audio = (() => {
   function setMuted(m) { muted = !!m; if (master) master.gain.value = muted ? 0 : 0.85; return muted; }
   function isMuted() { return muted; }
 
-  return { start, engineOn, engineOff, tick, impact, screech, beep, setMuted, isMuted };
+  return { start, engineOn, engineOff, tick, impact, setSkid, chirp, beep, setMuted, isMuted };
 })();
 
 /* =====================================================
@@ -2767,7 +3052,7 @@ function checkWallCollisions(r, dt) {
   const winSize = 14;
   const centerIdx = Math.floor((((r.splineProgress % 1) + 1) % 1) * N);
   let hit = false;
-  let worstIntoWall = 0;
+  let worstIntoWall = 0, worstCx = 0, worstCz = 0;
   for (let di = -winSize; di <= winSize; di++) {
     const idx = ((centerIdx + di) % N + N) % N;
     for (let side = 0; side < 2; side++) {
@@ -2794,7 +3079,7 @@ function checkWallCollisions(r, dt) {
       const intoWall = -(fwx * nx + fwz * nz);
       if (intoWall > 0) {
         hit = true;
-        if (intoWall > worstIntoWall) worstIntoWall = intoWall;
+        if (intoWall > worstIntoWall) { worstIntoWall = intoWall; worstCx = res.cx; worstCz = res.cz; }
       }
     }
   }
@@ -2806,11 +3091,11 @@ function checkWallCollisions(r, dt) {
     } else if (worstIntoWall < 0.8) {
       r.speed *= 0.5;
       r.collisionCooldown = 0.6;
-      if (r.isPlayer) audio.impact(0.5);
+      if (r.isPlayer) { audio.impact(0.5); registerDamage(worstIntoWall, isFrontContact(r, worstCx, worstCz)); }
     } else {
       r.speed *= 0.2;
       r.collisionCooldown = 1.0;
-      if (r.isPlayer) audio.impact(1.0);
+      if (r.isPlayer) { audio.impact(1.0); registerDamage(worstIntoWall, isFrontContact(r, worstCx, worstCz)); }
     }
   }
 }
@@ -2834,7 +3119,7 @@ function checkPillarCollisions(r, dt) {
     if (intoPillar > 0 && (r.collisionCooldown || 0) <= 0) {
       r.speed *= 0.25;
       r.collisionCooldown = 1.0;
-      if (r.isPlayer) audio.impact(0.8);
+      if (r.isPlayer) { audio.impact(0.8); registerDamage(0.85, isFrontContact(r, pillar.x, pillar.z)); }
     }
     break;
   }
@@ -2861,9 +3146,14 @@ function checkCarCollisions() {
         a.position.z += nz * overlap * 0.5;
         b.position.x -= nx * overlap * 0.5;
         b.position.z -= nz * overlap * 0.5;
+        const dmgSev = (a.isPlayer || b.isPlayer) ? Math.min(1, Math.abs(a.speed - b.speed) / 5) : 0;
         a.speed *= 0.92;
         b.speed *= 0.92;
-        if (a.isPlayer || b.isPlayer) audio.impact(0.3);
+        if (a.isPlayer || b.isPlayer) {
+          audio.impact(0.3);
+          const pc = a.isPlayer ? a : b, other = a.isPlayer ? b : a;
+          registerDamage(dmgSev, isFrontContact(pc, other.position.x, other.position.z));
+        }
       }
     }
   }
@@ -2877,6 +3167,7 @@ function updateRacers(dt) {
   for (const r of racers) {
     if (!r.finished) r.currentLapTime += dt;
     if ((r.collisionCooldown || 0) > 0) r.collisionCooldown -= dt;
+    if (r.isPlayer && (r.dmgCooldown || 0) > 0) r.dmgCooldown -= dt;
 
     // === INPUT → STEER (-1..1) ===
     let steer = 0;
@@ -2899,35 +3190,77 @@ function updateRacers(dt) {
       steer = Math.max(-1, Math.min(1, diff * 2.5));
     }
 
-    // === HEADING UPDATE ===
-    // Turn rate scales with speed: stopped cars barely pivot, fast cars turn at full rate
-    const turnRate = 2.2 * Math.min(1, Math.max(0.25, r.speed / 5));
-    r.heading += steer * turnRate * dt * (r.handling || 1);
+    // === HEADING UPDATE (grip-limited yaw) ===
+    // Real grip caps lateral acceleration, so max yaw rate falls as speed rises
+    // (omega = grip / v). Carry too much speed into a bend and you simply can't
+    // rotate enough — you run wide and must brake to make the corner. Lower GRIP
+    // = less cornering grip. Floor on v keeps slow cars able to pivot.
+    // Steering authority RISES with speed: gentle and un-twitchy when crawling,
+    // building to full bite by mid-speed (PEAK_SPEED), then capping. Because yaw
+    // caps, turn radius (v / yaw) widens again as top speed climbs, so the
+    // tightest corners still demand braking. Raise PEAK_SPEED to keep the climb
+    // going higher; raise YAW_MAX for more overall bite.
+    const YAW_MAX = 1.7, PEAK_SPEED = 6, LOW_FRAC = 0.35;   // a touch less grip → wash wider, brake more
+    let yaw = YAW_MAX * Math.max(LOW_FRAC, Math.min(1, r.speed / PEAK_SPEED));
+    if (r.lockedUp) yaw *= 0.12;       // locked front tyres wash out — almost no steering
+    r.heading += steer * yaw * dt * (r.handling || 1) * (r.gripMul || 1);   // gripMul drops to 0.5 with no front wing
+
+    // Snap oversteer (player): with more grip you can lean on it harder, but
+    // turning sharply at speed can break the rear loose without warning. A live
+    // slideRate adds extra rotation in the turn direction; lift or counter-steer
+    // to catch it, hold the turn into it and it builds toward a spin.
+    if (r.isPlayer) {
+      const OVERSTEER_SPEED = 8;          // only when really pushing
+      r.slideRate = r.slideRate || 0;
+      if (Math.abs(steer) > 0.85 && r.speed > OVERSTEER_SPEED && Math.abs(r.slideRate) < 0.3 && !r.lockedUp) {
+        const load = Math.min(1, (r.speed - OVERSTEER_SPEED) / Math.max(0.5, r.maxSpeed - OVERSTEER_SPEED));
+        if (Math.random() < 0.35 * load * (gas ? 1.3 : 0.7) * (r.rearLoose ? 2 : 1) * dt) {  // rarer; 2x with no rear wing
+          r.slideRate = Math.sign(steer) * (0.8 + Math.random() * 0.5);   // gentle snap
+        }
+      }
+      if (Math.abs(r.slideRate) > 0.001) {
+        r.heading += r.slideRate * dt;
+        // Recovery is ALWAYS positive so the rear always comes back — with on/off
+        // steering a slide you must finesse would be uncatchable. Counter-steering
+        // catches it fast; holding into it just recovers a little slower.
+        let rec = 3.5;
+        if (steer !== 0) rec += (Math.sign(steer) === -Math.sign(r.slideRate) ? 2.5 : -0.8);
+        r.slideRate -= r.slideRate * Math.min(1, dt * rec);
+        if (Math.abs(r.slideRate) < 0.05) r.slideRate = 0;
+      }
+      r.sliding = Math.abs(r.slideRate) > 0.4;
+    }
 
     // === SPEED UPDATE ===
     let target, rate;
     if (r.finished) {
       target = 0; rate = 0.6;   // gentle coast — decay to stop over ~5s
     } else if (r.isPlayer) {
-      if (braking) { target = 0; rate = 4; }
-      else if (gas) {
-        // Lift for the corner you're in — same idea as the AI but gentler (cap
-        // 0.30 vs the AI's 0.45), so a clean line still beats them. Without this
-        // the player held full speed through every bend while the AI lifted,
-        // which is the >100% cornering gap that made desktop wins trivial.
-        const curveSlow = 1 - Math.min(0.30, estimateCurvature((r.splineProgress + 0.02) % 1) * 8);
-        target = r.maxSpeed * curveSlow;
-        rate = 2;
+      if (!braking) { r.brakeHold = 0; r.lockedUp = false; }
+      if (braking) {
+        // Brake too long above walking pace and the wheels lock: steering washes
+        // out (see yaw block) and the skidding tyres scrub speed far more slowly
+        // than threshold braking would — so you slide on and miss the apex.
+        // Stab and release to stay below the lock-up threshold.
+        r.brakeHold = (r.brakeHold || 0) + dt;
+        if (r.speed > 2 && r.brakeHold > 0.3) r.lockedUp = true;
+        target = 0; rate = r.lockedUp ? 1.6 : 4;
       }
+      else if (gas) { target = r.maxSpeed; rate = 2; }   // no auto-lift: brake yourself
       else { target = 0; rate = 0.5; }
+      // Launch wheelspin: full throttle from low speed lights up the rears.
+      r.wheelspin = gas && !braking && r.speed < 1;
     } else {
-      // AI: slow for upcoming curvature
-      const curveSlow = 1 - Math.min(0.45, estimateCurvature((r.splineProgress + 0.02) % 1) * 8);
+      // AI: brake earlier and harder for upcoming curvature so it can still make
+      // the corners under the reduced grip (cap 0.65 = slows to 35% in hairpins).
+      const curveSlow = 1 - Math.min(0.65, estimateCurvature((r.splineProgress + 0.02) % 1) * 11);
       target = r.maxSpeed * curveSlow;
       rate = 1.8;
     }
+    if (r.wheelspin) rate *= 0.2;   // traction-limited launch — the car spins before it hooks up
     r.speed += (target - r.speed) * Math.min(1, dt * rate);
     r.speed = Math.max(0, r.speed);
+    if (r.isPlayer && r.sliding) r.speed *= (1 - Math.min(0.5, dt));   // a slide scrubs speed
 
     // === POSITION UPDATE (forward along heading) ===
     const forwardX = -Math.sin(r.heading);
@@ -2993,6 +3326,24 @@ function updateCamera(dt) {
   const isRacing = raceState === 'racing' || raceState === 'countdown';
   const isFinishing = raceState === 'finishing';
 
+  // Keep the shadow frustum centred on the player so shadows don't drop out on
+  // far parts of the circuit (they used to vanish before the tunnel — the fixed
+  // ±22 shadow camera simply didn't reach that far from the world origin).
+  if ((isRacing || isFinishing) && playerCar) {
+    const pc = playerCar.position;
+    sun.target.position.set(pc.x, 0, pc.z);
+    sun.position.set(pc.x + 9, 16, pc.z + 7);
+    sun.target.updateMatrixWorld();
+  }
+  // Dim the sun and sky hard inside the tunnel so the interior reads as dark,
+  // then bring them back on exit — lerped so the mouth feels like driving into
+  // shadow rather than a light switch.
+  const inTun = isRacing && TUNNEL && playerCar &&
+    playerCar.splineProgress > TUNNEL.tStart && playerCar.splineProgress < TUNNEL.tEnd;
+  const lk = Math.min(1, dt * 4);
+  sun.intensity  += ((inTun ? 0.35 : 2.7)  - sun.intensity)  * lk;
+  hemi.intensity += ((inTun ? 0.28 : 1.15) - hemi.intensity) * lk;
+
   if (isRacing) {
     const p = playerCar.position;
     const h = playerCar.heading;
@@ -3014,25 +3365,19 @@ function updateCamera(dt) {
     camera.lookAt(p.x, p.y + lookHeight, p.z);
     cameraWasRacing = true;
   } else if (isFinishing) {
-    // Drone shot: high, offset to the flag side, slightly ahead along the racing direction.
-    // The cars coast forward, the flag waves at the line, the camera frames both.
+    // Finish-line beauty shot: keep chasing the car and zoom in over 3 seconds.
     const p = playerCar.position;
-    const startPt = trackCurve.getPointAt(0);
-    const startTan = trackCurve.getTangentAt(0).clone().normalize();
-    const startPerp = new THREE.Vector3(-startTan.z, 0, startTan.x);
-    const fSide = TRACK.flagSide ?? -1;
-
-    const droneTarget = startPt.clone()
-      .addScaledVector(startPerp, 8 * fSide)
-      .addScaledVector(startTan, 4);
-    droneTarget.y = 6;
-
-    camera.position.lerp(droneTarget, Math.min(1, dt * 1.4));
-
-    // Look-at = midpoint of player and start line, slightly above ground so flag is in frame
-    const lookX = (p.x + startPt.x) / 2;
-    const lookZ = (p.z + startPt.z) / 2;
-    camera.lookAt(lookX, 1.5, lookZ);
+    const h = playerCar.heading;
+    const z = Math.min(1, finishingTime / 3);   // 0 → 1 across the 3s window
+    const camDist = 4.2 - z * 2.4;              // pull in from the race distance...
+    const camHeight = 2.2 - z * 1.1;            // ...and drop a little lower
+    const target = new THREE.Vector3(
+      p.x + Math.sin(h) * camDist,
+      p.y + camHeight,
+      p.z - Math.cos(h) * camDist
+    );
+    camera.position.lerp(target, Math.min(1, dt * 5));
+    camera.lookAt(p.x, p.y + 0.4, p.z);
     cameraWasRacing = true;
   } else if (raceState === 'podium') {
     // Slow orbit around the podium. Lerping to the orbit position (which advances
@@ -3064,6 +3409,48 @@ function animate() {
   updatePodium(dt);
   updateCamera(dt);
   animateFlag(clock.elapsedTime);
+  // Tyre smoke + skid while the player is locked up under braking
+  smoke.update(dt);
+  updateDebris(dt);
+  let skidNow = false, skidHeavy = false;
+  if (raceState === 'racing' && playerCar) {
+    const pc = playerCar;
+    const steerIn = (steerRight ? 1 : 0) - (steerLeft ? 1 : 0);
+    // Front understeer must BUILD UP: only sustained hard cornering near top
+    // speed counts as real grip loss — with on/off steering, a brief turn at
+    // pace shouldn't smoke. Wheelspin: rears overpowered at launch.
+    const turning = Math.abs(steerIn) > 0.85 && !pc.lockedUp && !pc.sliding;
+    // Healthy car: front scrub only on sustained hard cornering near top speed.
+    if (turning && pc.speed > 10) pc.usTime = (pc.usTime || 0) + dt; else pc.usTime = 0;
+    // No front wing = no front grip: the car scrubs and screeches on any turn-in,
+    // from much lower speed and with no build-up needed.
+    const understeer = pc.frontWingGone ? (turning && pc.speed > 4) : (pc.usTime > 0.3);
+    const wheelspin = !!pc.wheelspin;
+    const skidActive = (pc.lockedUp || pc.sliding || understeer || wheelspin) && (pc.speed > 1.5 || wheelspin);
+    skidNow = skidActive;
+    skidHeavy = pc.lockedUp || (understeer && pc.frontWingGone);
+    if (skidActive && !skidWasActive) skidTimer = 0;   // first chirp immediately at onset
+    skidWasActive = skidActive;
+    if (skidActive) {
+      const m = pc.mesh; m.updateMatrixWorld(true);
+      const offs = pc.lockedUp
+        ? [[0.26,0.05,0.26],[-0.26,0.05,0.26],[0.26,0.05,-0.24],[-0.26,0.05,-0.24]]
+        : understeer
+          ? [[0.26,0.05,0.26],[-0.26,0.05,0.26]]      // front tyres scrubbing
+          : [[0.26,0.05,-0.24],[-0.26,0.05,-0.24]];   // rears (slide / wheelspin)
+      skidFrame++;
+      const spawnN = skidHeavy ? 2 : (skidFrame % 3 === 0 ? 1 : 0);
+      for (let k = 0; k < spawnN; k++) {
+        const o = offs[(smokeIdx++) % offs.length];
+        const wp = m.localToWorld(new THREE.Vector3(o[0], o[1], o[2]));
+        smoke.puff(wp.x, wp.y, wp.z);
+      }
+      // Chirp-chirp layered over the sustained screech (driven below).
+      skidTimer -= dt;
+      if (skidTimer <= 0) { audio.chirp(); skidTimer = skidHeavy ? 0.16 : 0.3; }
+    }
+  }
+  audio.setSkid(skidNow, skidHeavy);   // the long screech holds while skidding, fades on release
   renderer.render(scene, camera);
 }
 animate();
@@ -3099,9 +3486,9 @@ function checkAllFinished() {
   raceState = 'finishing';
   finishingTime = 0;
   const rtHide = document.querySelector('.race-top'); if (rtHide) rtHide.style.display = 'none';
-  // 4 seconds of drone shot, then the podium ceremony takes over for 5 seconds,
-  // then endRace shows the results overlay.
-  setTimeout(transitionToPodium, 4000);
+  // 3 seconds chasing and zooming on the car, then the podium ceremony takes
+  // over for 5 seconds, then endRace shows the results overlay.
+  setTimeout(transitionToPodium, 3000);
 }
 
 function endRace() {
@@ -3353,12 +3740,17 @@ const ICON_SOUND = '<path d="M4 9v6h4l5 4V5L8 9H4z"/><path d="M16 8.5a4.5 4.5 0 
 const ICON_MUTED = '<path d="M4 9v6h4l5 4V5L8 9H4z" opacity="0.5"/><path d="M16 9l5 6m0-6l-5 6" fill="none" stroke="#a4e132" stroke-width="2" stroke-linecap="round"/>';
 let soundMuted = false;
 const muteSvg = document.getElementById('mute-icon');
-function renderMute() { muteSvg.innerHTML = soundMuted ? ICON_MUTED : ICON_SOUND; }
-document.getElementById('btn-mute').addEventListener('click', () => {
-  soundMuted = !soundMuted;
-  audio.setMuted(soundMuted);
-  renderMute();
-});
+const muteSvgBig = document.getElementById('mute-icon-big');
+function renderMute() {
+  const ic = soundMuted ? ICON_MUTED : ICON_SOUND;
+  if (muteSvg) muteSvg.innerHTML = ic;
+  if (muteSvgBig) muteSvgBig.innerHTML = ic;
+  const fab = document.getElementById('btn-mute-big');
+  if (fab) fab.classList.toggle('muted', soundMuted);
+}
+function toggleMute() { soundMuted = !soundMuted; audio.setMuted(soundMuted); renderMute(); }
+document.getElementById('btn-mute').addEventListener('click', toggleMute);
+document.getElementById('btn-mute-big').addEventListener('click', toggleMute);
 renderMute();
 
 // Stubbed second circuit — roadmap placeholder, not yet playable
