@@ -702,31 +702,36 @@ const MONACO_TRACK = {
   laps: 2,
   trackWidth: 2.2,
 
-  // Spline control points [x, y, z] — clockwise from start/finish
+  // Spline control points [x, y, z] — clockwise from start/finish.
+  // y = elevation (exaggerated arcade profile): a steep climb out of Sainte
+  // Dévote up to Casino Square (the 8.5-unit peak), then a long plunge through
+  // the hairpin down to the tunnel and harbour floor (0), low along the
+  // start/finish straight. Support pillars auto-build under the raised sections;
+  // to tame or amplify the swoop, scale the non-zero y values together.
   controlPoints: [
-    [-15, 0, -8],    //  1: start/finish line (heading east)
-    [ -2, 0, -8],    //  2: east end of start straight
-    [  6, 0, -13],   //  3: Ste Devote (right kink)
-    [ 15, 0, -17],   //  4: Beau Rivage
-    [ 19, 0, -19],   //  5: Massenet (left)
-    [ 25, 0, -19],   //  6: Casino Square (right)
-    [ 28, 0, -16],   //  7: Mirabeau Haute
-    [ 32, 0, -14],   //  8: approaching Loews
-    [ 34, 0, -10],   //  9: Loews hairpin apex
-    [ 32, 0, -6],    // 10: Mirabeau Bas (hairpin exit)
-    [ 28, 0, -3],    // 11: east straight
-    [ 26, 0,  5],    // 12: turning back west
-    [ 20, 0, 11],    // 13: Portier
-    [ 10, 0, 15],    // 14: tunnel exit
-    [  3, 0, 18],    // 15: Nouvelle Chicane (south kink)
-    [ -3, 0, 16],    // 16: harbor straight, middle
-    [-14, 0, 14],    // 17: Tabac
-    [-17, 0, 12],    // 18: Piscine entry (Pool Gauche)
-    [-20, 0, 10],    // 19: Piscine centre
-    [-22, 0,  7],    // 20: Piscine exit (Pool Droite)
-    [-25, 0,  0],    // 21: Rascasse
-    [-22, 0, -5],    // 22: west side
-    [-19, 0, -8],    // 23: Anthony Noghes
+    [-15, 0.0, -8],   //  1: start/finish line (heading east)  — low
+    [ -2, 0.5, -8],   //  2: east end of start straight        — climb begins
+    [  6, 2.5, -13],  //  3: Ste Devote (right kink)
+    [ 15, 5.5, -17],  //  4: Beau Rivage (steep climb)
+    [ 19, 7.5, -19],  //  5: Massenet (left)
+    [ 25, 8.5, -19],  //  6: Casino Square (right)             — PEAK
+    [ 28, 7.5, -16],  //  7: Mirabeau Haute (plunge begins)
+    [ 32, 5.5, -14],  //  8: approaching Loews
+    [ 34, 4.0, -10],  //  9: Loews hairpin apex
+    [ 32, 2.8, -6],   // 10: Mirabeau Bas (hairpin exit)
+    [ 28, 1.6, -3],   // 11: east straight (descending)
+    [ 26, 0.8,  5],   // 12: turning back west
+    [ 20, 0.2, 11],   // 13: Portier (into the tunnel)
+    [ 10, 0.0, 15],   // 14: tunnel exit                       — harbour floor
+    [  3, 0.0, 18],   // 15: Nouvelle Chicane (south kink)
+    [ -3, 0.0, 16],   // 16: harbor straight, middle
+    [-14, 0.0, 14],   // 17: Tabac
+    [-17, 0.0, 12],   // 18: Piscine entry (Pool Gauche)
+    [-20, 0.0, 10],   // 19: Piscine centre
+    [-22, 0.0,  7],   // 20: Piscine exit (Pool Droite)
+    [-25, 0.3,  0],   // 21: Rascasse
+    [-22, 1.0, -5],   // 22: west side (gentle rise back)
+    [-19, 0.5, -8],   // 23: Anthony Noghes → back down to start
   ],
 
   theme: {
@@ -831,14 +836,9 @@ sun.shadow.normalBias = 0.02;
 scene.add(sun);
 scene.add(sun.target);   // target must be in the scene graph for shadow-follow
 
-// Ground
-const ground = new THREE.Mesh(
-  new THREE.PlaneGeometry(120, 120),
-  new THREE.MeshLambertMaterial({ color: TRACK.theme.ground })
-);
-ground.rotation.x = -Math.PI / 2;
-ground.receiveShadow = true;
-scene.add(ground);
+// Ground is built as elevation-following terrain AFTER the track curve exists
+// (see buildTerrain, below the curve). A flat plane lived here, but it couldn't
+// reference the curve — which isn't defined yet at this point in the file.
 
 /* =====================================================
    TYRE SMOKE — pooled camera-facing sprites, no external assets.
@@ -986,6 +986,49 @@ function registerDamage(severity, isFront) {
 const trackPoints = TRACK.controlPoints.map(p => new THREE.Vector3(p[0], p[1], p[2]));
 const trackCurve = new THREE.CatmullRomCurve3(trackPoints, true, 'catmullrom', 0.5);
 const TRACK_WIDTH = TRACK.trackWidth;
+
+// --- Elevation-following terrain ---------------------------------------------
+// Precompute curve samples once so terrainHeight() stays cheap (no getPointAt per call).
+const CURVE_PTS = [];
+for (let i = 0; i < 220; i++) CURVE_PTS.push(trackCurve.getPointAt(i / 220));
+
+// Land height at a world (x,z): take the nearest track point's height and fade it
+// to the flat base ground over `fade` units, so the ground rises to meet the road
+// and flattens away from it. Build-time only — never call this per frame.
+function terrainHeight(x, z) {
+  let bestD = Infinity, bestY = 0;
+  for (let k = 0; k < CURVE_PTS.length; k++) {
+    const p = CURVE_PTS[k];
+    const dx = p.x - x, dz = p.z - z;
+    const d = dx * dx + dz * dz;
+    if (d < bestD) { bestD = d; bestY = p.y; }
+  }
+  const dist = Math.sqrt(bestD);
+  const inner = TRACK_WIDTH + 2.5;                 // full road height under/beside the track
+  const fade = 16;                                 // blend down to flat ground over this distance
+  let k = dist <= inner ? 1 : Math.max(0, 1 - (dist - inner) / fade);
+  k = k * k * (3 - 2 * k);                         // smoothstep for a soft hill shoulder
+  return bestY * k - 0.08;                          // 8cm under the road to avoid z-fighting
+}
+
+function buildTerrain() {
+  const SIZE = 160, SEG = 80;
+  const geo = new THREE.PlaneGeometry(SIZE, SIZE, SEG, SEG);
+  const pos = geo.attributes.position;
+  for (let i = 0; i < pos.count; i++) {
+    const lx = pos.getX(i), ly = pos.getY(i);
+    // mesh is rotated -PI/2 about X below: worldX = lx, worldZ = -ly, worldY = localZ
+    pos.setZ(i, terrainHeight(lx, -ly));
+  }
+  pos.needsUpdate = true;
+  geo.computeVertexNormals();
+  const m = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ color: TRACK.theme.ground }));
+  m.rotation.x = -Math.PI / 2;
+  m.receiveShadow = true;
+  return m;
+}
+const ground = buildTerrain();
+scene.add(ground);
 
 function trackPerp(t) {
   const tan = trackCurve.getTangentAt(t).normalize();
@@ -1275,8 +1318,9 @@ function buildTrees() {
     if (tooClose) continue;
     placed.push([x, z]);
 
+    const gy = terrainHeight(x, z);   // sit the tree on the sloped land
     const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.1, 0.3, 6), trunkMat);
-    trunk.position.set(x, 0.15, z);
+    trunk.position.set(x, gy + 0.15, z);
     group.add(trunk);
 
     const isCone = Math.random() > 0.4;
@@ -1284,7 +1328,7 @@ function buildTrees() {
       ? new THREE.ConeGeometry(0.45 + Math.random()*0.2, 1.1 + Math.random()*0.6, 6)
       : new THREE.SphereGeometry(0.45 + Math.random()*0.15, 6, 5);
     const leaves = new THREE.Mesh(leafGeom, leafMats[Math.floor(Math.random()*leafMats.length)]);
-    leaves.position.set(x, isCone ? 0.9 : 0.6, z);
+    leaves.position.set(x, gy + (isCone ? 0.9 : 0.6), z);
     leaves.castShadow = true;
     group.add(leaves);
   }
@@ -1350,7 +1394,7 @@ function buildBuildings() {
     const roofMat = new THREE.MeshLambertMaterial({ color: style.roofColor });
     const mats = [sideMat, sideMat, roofMat, roofMat, sideMat, sideMat];
     const box = new THREE.Mesh(new THREE.BoxGeometry(b.w, b.h, b.d), mats);
-    box.position.set(safeX, b.h / 2, safeZ);
+    box.position.set(safeX, terrainHeight(safeX, safeZ) + b.h / 2, safeZ);
     box.castShadow = true;
     box.receiveShadow = true;
     group.add(box);
@@ -2622,13 +2666,13 @@ function setupRace() {
   scene.add(pMesh);
   playerCar = initRacer(pMesh, 0, 0, true, {
     color: playerColor,
-    maxSpeed: 11.0 * upgradeMult('speed'), // higher top speed; corners demand braking
+    maxSpeed: 7.04 * upgradeMult('speed'), // -36% from original; corners demand braking
     handling: upgradeMult('handling')
   });
   racers.push(playerCar);
 
   // AI: difficulty scales gently with level (world units / sec)
-  const aiBase = 12.0 + Math.min(2.0, state.level * 0.3);
+  const aiBase = 8.0 + Math.min(1.28, state.level * 0.192);   // above the player off the line for early challenge
   const otherFlavours = FLAVOURS.filter((_, i) => i !== state.carFlavour);
   const aiOffsets = [-0.6, 0.6, -0.3];
   for (let i = 0; i < 3; i++) {
@@ -2639,7 +2683,7 @@ function setupRace() {
     const splineStart = -0.004 * (i + 1);
     racers.push(initRacer(mesh, aiOffsets[i], splineStart, false, {
       color: c,
-      maxSpeed: aiBase + Math.random() * 0.9,
+      maxSpeed: aiBase + Math.random() * 0.576,
       handling: 1.0 + Math.random() * 0.3
     }));
   }
@@ -2649,7 +2693,17 @@ function setupRace() {
 function positionCar(r) {
   r.mesh.position.copy(r.position);
   r.mesh.rotation.y = -r.heading;
-  r.mesh.rotation.x = 0;
+  // Pitch the chassis to the track slope. rotation.order is 'YXZ', so X tilts the
+  // car about its post-yaw lateral axis — nose up on a climb, down on a plunge.
+  {
+    const tan = trackCurve.getTangentAt(r.splineProgress);
+    const fX = -Math.sin(r.heading), fZ = Math.cos(r.heading);
+    const dir = (fX * tan.x + fZ * tan.z) >= 0 ? 1 : -1;   // travelling along +t or -t?
+    const slope = Math.max(-1, Math.min(1, dir * tan.y));  // sin(pitch), signed by travel
+    const targetPitch = -Math.asin(slope);
+    r.pitch = (r.pitch || 0) + (targetPitch - (r.pitch || 0)) * 0.2;
+    r.mesh.rotation.x = r.pitch;
+  }
   r.mesh.rotation.z = r.roll || 0;
   // Spin wheels in proportion to forward speed (world-units/sec)
   if (r.mesh.userData.wheels) {
@@ -2720,10 +2774,10 @@ const audio = (() => {
   let ctx = null, master = null;
   let noiseBuffer = null;
   // Engine voice nodes — rebuilt on each engineOn (oscillators are one-shot).
-  let osc = null, oscB = null, subOsc = null;
+  let engSrc = null, subOsc = null, lopeLfo = null, lopeGain = null;
   let toneGain = null, noiseSrc = null, noiseBP = null,
       noiseGain = null, lowpass = null, engineGain = null;
-  let engineWave = null;
+  let engineBuf = null;
   let skidSrc = null, skidBP = null, skidLfo = null, skidGain = null;   // sustained tyre-skid voice
   let engineState = 'off';
   let screechCooldown = 0;
@@ -2733,7 +2787,7 @@ const audio = (() => {
   // Idle / redline firing fundamentals and the speed that maps to redline. A
   // fully speed-upgraded car (maxSpeed ~9.3) sits near redline; a base car tops
   // out partway up the range, so speed upgrades audibly let the engine rev higher.
-  const IDLE_HZ = 90, REDLINE_HZ = 480, REV_REF = 11;   // deeper firing range
+  const IDLE_HZ = 90, REDLINE_HZ = 480, REV_REF = 7.04;   // tracks the lowered top speed
 
   function makeNoiseBuffer(c) {
     const len = c.sampleRate * 2;
@@ -2743,18 +2797,39 @@ const audio = (() => {
     return buf;
   }
 
-  // Engine timbre as a harmonic spectrum: 1/n rolloff with a formant bump near
-  // the 4th harmonic so it reads as a throaty exhaust note, not a buzzer, and
-  // stays audible on phone speakers that can't reproduce the low fundamental.
-  function makeEngineWave(c) {
-    const N = 14;
-    const real = new Float32Array(N), imag = new Float32Array(N);
-    for (let n = 1; n < N; n++) {
-      let a = 1 / n;                                              // steeper rolloff → less top-end whine
-      a *= 1 + 0.8 * Math.exp(-Math.pow((n - 3) / 2.6, 2));       // lower formant → throaty, not shrill
-      imag[n] = a;
+  const ENGINE_REF_HZ = 100;   // the buffer's fundamental at playbackRate 1
+
+  // One engine cycle as a looping buffer: a train of exhaust "blats" rather than a
+  // steady oscillator. Each fundamental period has a quick attack and a decay (the
+  // pulse) over a throaty harmonic body with a formant near the 4th harmonic. Two
+  // periods are baked at slightly uneven level so the loop has a lumpy A/B firing
+  // feel. Pitch is set later by playbackRate, so the pulses speed up with revs.
+  function makeEngineBuffer(c) {
+    const period = Math.round(c.sampleRate / ENGINE_REF_HZ);
+    const len = period * 2;
+    const buf = c.createBuffer(1, len, c.sampleRate);
+    const d = buf.getChannelData(0);
+    const H = 18;
+    for (let i = 0; i < len; i++) {
+      const pPos = (i % period) / period;                  // 0..1 within this period
+      const lump = (Math.floor(i / period) === 0) ? 1.0 : 0.82;
+      const env = pPos < 0.04 ? pPos / 0.04 : Math.exp(-(pPos - 0.04) * 3.2);  // attack then decay
+      const ph = i / period;
+      let tone = 0;
+      for (let nn = 1; nn <= H; nn++) {
+        let a = 1 / nn;
+        a *= 1 + 1.0 * Math.exp(-Math.pow((nn - 4) / 3, 2));   // throaty formant ~4th harmonic
+        tone += a * Math.sin(2 * Math.PI * nn * ph);
+      }
+      d[i] = (env * (0.5 + 0.15 * tone) + 0.05 * tone) * lump;  // pulse-shaped AM + a little body
     }
-    return c.createPeriodicWave(real, imag, { disableNormalization: false });
+    // de-DC, normalise, and fade both ends to zero so the loop seam is click-free
+    let mean = 0; for (let i = 0; i < len; i++) mean += d[i]; mean /= len;
+    let peak = 0; for (let i = 0; i < len; i++) { d[i] -= mean; const a = Math.abs(d[i]); if (a > peak) peak = a; }
+    if (peak > 0) for (let i = 0; i < len; i++) d[i] /= peak;
+    const tail = Math.min(24, period >> 2);
+    for (let k = 0; k < tail; k++) { const g = k / tail; d[k] *= g; d[len - 1 - k] *= g; }
+    return buf;
   }
 
   function ensureCtx() {
@@ -2766,7 +2841,7 @@ const audio = (() => {
     master.gain.value = muted ? 0 : 0.85;
     master.connect(ctx.destination);
     noiseBuffer = makeNoiseBuffer(ctx);
-    engineWave = makeEngineWave(ctx);
+    engineBuf = makeEngineBuffer(ctx);
     buildSkidVoice();
     return ctx;
   }
@@ -2784,26 +2859,33 @@ const audio = (() => {
   // order sub and a gentle detune beat; a periodic LFO tremolo read as a
   // mechanical clap, so the movement lives in the pulses, not a gain wobble.
   function buildEngine() {
-    if (!ctx || osc || !engineWave) return;
+    if (!ctx || engSrc || !engineBuf) return;
     const t = ctx.currentTime;
-    const f = smoothedFreq;
 
-    osc = ctx.createOscillator();
-    osc.setPeriodicWave(engineWave);
-    osc.frequency.value = f;
+    // Core voice: the looped engine-cycle buffer. Pitch rides playbackRate, so the
+    // exhaust pulses speed up with revs the way a real engine does — no steady
+    // oscillator tone, no detune beat.
+    engSrc = ctx.createBufferSource();
+    engSrc.buffer = engineBuf;
+    engSrc.loop = true;
+    engSrc.playbackRate.value = smoothedFreq / ENGINE_REF_HZ;
 
-    oscB = ctx.createOscillator();
-    oscB.setPeriodicWave(engineWave);
-    oscB.frequency.value = f;
-    oscB.detune.value = 3;             // tiny beat → faint shimmer, no metallic clap
+    // Idle lope: a slow pitch wobble, deep at idle and fading with revs, so the
+    // engine breathes rather than holding a dead-steady note.
+    lopeLfo = ctx.createOscillator();
+    lopeLfo.type = 'sine';
+    lopeLfo.frequency.value = 5.5;
+    lopeGain = ctx.createGain();
+    lopeGain.gain.value = 0.05;        // ± playbackRate; tick() trims it with revs
+    lopeLfo.connect(lopeGain).connect(engSrc.playbackRate);
 
+    // Half-order sub for low-end body on phone speakers that can't reach the fundamental.
     subOsc = ctx.createOscillator();
     subOsc.type = 'sine';
-    subOsc.frequency.value = f * 0.5;  // half-order lump
+    subOsc.frequency.value = smoothedFreq * 0.5;
 
-    const oscG = ctx.createGain();  oscG.gain.value = 1.0;
-    const oscBG = ctx.createGain(); oscBG.gain.value = 0.4;
-    const subG = ctx.createGain();  subG.gain.value = 0.5;   // more half-order octave for body
+    const srcG = ctx.createGain(); srcG.gain.value = 1.0;
+    const subG = ctx.createGain(); subG.gain.value = 0.45;
 
     toneGain = ctx.createGain();
     toneGain.gain.value = 0.5;
@@ -2818,22 +2900,23 @@ const audio = (() => {
     noiseGain = ctx.createGain();
     noiseGain.gain.value = 0.05;   // intake/exhaust air
 
+    // Resonant lowpass: the Q gives a vocal "throat" that sweeps with revs (the
+    // vroom). The old voice had an almost flat filter and read as a buzzer.
     lowpass = ctx.createBiquadFilter();
     lowpass.type = 'lowpass';
     lowpass.frequency.value = 700;
-    lowpass.Q.value = 0.8;
+    lowpass.Q.value = 3.0;
 
     engineGain = ctx.createGain();
     engineGain.gain.value = 0;
 
-    osc.connect(oscG).connect(toneGain);
-    oscB.connect(oscBG).connect(toneGain);
+    engSrc.connect(srcG).connect(toneGain);
     subOsc.connect(subG).connect(toneGain);
     toneGain.connect(lowpass);
     noiseSrc.connect(noiseBP).connect(noiseGain).connect(lowpass);
     lowpass.connect(engineGain).connect(master);
 
-    osc.start(t); oscB.start(t); subOsc.start(t); noiseSrc.start(t);
+    engSrc.start(t); subOsc.start(t); lopeLfo.start(t); noiseSrc.start(t);
   }
 
   function engineOn() {
@@ -2853,15 +2936,15 @@ const audio = (() => {
     // Stop every source after the fade, then null refs so the next engineOn
     // rebuilds a fresh voice (oscillators can't be restarted once stopped).
     const stopAt = t + 1.2;
-    [osc, oscB, subOsc, noiseSrc].forEach(n => { if (n) { try { n.stop(stopAt); } catch (e) {} } });
-    osc = oscB = subOsc = null;
-    toneGain = noiseSrc = noiseBP = noiseGain = lowpass = engineGain = null;
+    [engSrc, subOsc, lopeLfo, noiseSrc].forEach(n => { if (n) { try { n.stop(stopAt); } catch (e) {} } });
+    engSrc = subOsc = lopeLfo = null;
+    toneGain = noiseSrc = noiseBP = noiseGain = lowpass = engineGain = lopeGain = null;
   }
 
   // Per-frame update. Speed sets the firing fundamental (idle→redline), smoothed
   // for inertia; the filters open and the noise brightens with RPM/throttle.
   function tick(dt, speed, throttling, steerMag) {
-    if (!ctx || engineState !== 'on' || !osc) return;
+    if (!ctx || engineState !== 'on' || !engSrc) return;
     let rpm = Math.min(1, Math.max(0, speed / REV_REF));
     // Launch rev: with the throttle open at low road speed the engine still
     // spins up (clutch slip / wheelspin), so the note climbs even when the car
@@ -2872,10 +2955,10 @@ const audio = (() => {
     smoothedFreq += (targetFreq - smoothedFreq) * Math.min(1, dt * 9);   // snappier throttle response
     const t = ctx.currentTime;
     const f = smoothedFreq;
-    osc.frequency.setTargetAtTime(f, t, 0.04);
-    oscB.frequency.setTargetAtTime(f, t, 0.04);
+    engSrc.playbackRate.setTargetAtTime(f / ENGINE_REF_HZ, t, 0.04);
     subOsc.frequency.setTargetAtTime(f * 0.5, t, 0.04);
-    const cut = 700 + rpm * 4100 + (throttling ? 1500 : 0);   // tamer ceiling → deeper, less drill
+    lopeGain.gain.setTargetAtTime(0.05 * (1 - rpm) + 0.004, t, 0.1);   // lope deep at idle, gone at speed
+    const cut = 600 + rpm * 3800 + (throttling ? 1400 : 0);           // resonant throat sweeps with revs
     lowpass.frequency.setTargetAtTime(cut, t, 0.06);
     noiseBP.frequency.setTargetAtTime(350 + rpm * 2000, t, 0.08);
     noiseGain.gain.setTargetAtTime(0.05 + rpm * 0.05 + (throttling ? 0.05 : 0), t, 0.08);
@@ -2996,7 +3079,7 @@ const clock = new THREE.Clock();
 
 function updateSplineProgress(r) {
   // Local search around r.splineProgress for the nearest curve point.
-  // Y-weighting disambiguates upper bridge vs underpass at the figure-of-eight crossover.
+  // Nearest curve point by XZ distance (this loop never crosses itself in plan view).
   const oldT = r.splineProgress;
   const steps = 16;
   const range = 0.05;
@@ -3007,18 +3090,35 @@ function updateSplineProgress(r) {
     const p = trackCurve.getPointAt(t);
     const dx = r.position.x - p.x;
     const dz = r.position.z - p.z;
-    const dy = r.position.y - p.y;
-    const score = dx * dx + dz * dz + dy * dy * 4;
+    // XZ-only. A Y term here (originally for a figure-of-eight crossover this track
+    // doesn't have) made the search lag on a slope then snap forward, which read out
+    // as a juddering car height. Reinstate a modest Y weight only for a crossover track.
+    const score = dx * dx + dz * dz;
     if (score < bestScore) {
       bestScore = score;
       bestT = t;
     }
   }
-  let delta = bestT - oldT;
+  // Parabolic sub-sample refinement. The discrete bestT is quantised to the search
+  // step, which stair-steps the height on slopes. Fit a parabola through the nearest
+  // sample and its two neighbours to locate the true minimum between them, giving a
+  // continuous t — and therefore a continuous, planted height with no easing needed.
+  const stepT = range / steps;
+  const pM = trackCurve.getPointAt(((bestT - stepT) % 1 + 1) % 1);
+  const pP = trackCurve.getPointAt(((bestT + stepT) % 1 + 1) % 1);
+  const sM = (r.position.x - pM.x) ** 2 + (r.position.z - pM.z) ** 2;
+  const sP = (r.position.x - pP.x) ** 2 + (r.position.z - pP.z) ** 2;
+  const denom = sM - 2 * bestScore + sP;
+  let refined = bestT;
+  if (denom > 1e-6) {
+    const off = Math.max(-stepT, Math.min(stepT, 0.5 * (sM - sP) / denom * stepT));
+    refined = ((bestT + off) % 1 + 1) % 1;
+  }
+  let delta = refined - oldT;
   if (delta > 0.5) delta -= 1;
   else if (delta < -0.5) delta += 1;
   r.cumulativeProgress += delta;
-  r.splineProgress = bestT;
+  r.splineProgress = refined;
 }
 
 function getLateralOffset(r) {
@@ -3251,11 +3351,13 @@ function updateRacers(dt) {
       // Launch wheelspin: full throttle from low speed lights up the rears.
       r.wheelspin = gas && !braking && r.speed < 1;
     } else {
-      // AI: brake earlier and harder for upcoming curvature so it can still make
-      // the corners under the reduced grip (cap 0.65 = slows to 35% in hairpins).
-      const curveSlow = 1 - Math.min(0.65, estimateCurvature((r.splineProgress + 0.02) % 1) * 11);
+      // AI: lift for upcoming curvature, but carry far more corner speed than before
+      // so it laps quicker and pressures the player early (cap 0.5 = slows to 50% in
+      // hairpins, not 35%). It follows the line and its steering grows with speed, so
+      // the extra pace doesn't make it run wide.
+      const curveSlow = 1 - Math.min(0.5, estimateCurvature((r.splineProgress + 0.02) % 1) * 9);
       target = r.maxSpeed * curveSlow;
-      rate = 1.8;
+      rate = 2.2;   // pulls out of corners harder than the player (rate 2.0)
     }
     if (r.wheelspin) rate *= 0.2;   // traction-limited launch — the car spins before it hooks up
     r.speed += (target - r.speed) * Math.min(1, dt * rate);
@@ -3271,6 +3373,10 @@ function updateRacers(dt) {
     // === SPLINE PROGRESS + GROUND HEIGHT ===
     updateSplineProgress(r);
     const splineP = trackCurve.getPointAt(r.splineProgress);
+    // Plant the car on the surface. splineProgress is now sub-sample continuous (see
+    // updateSplineProgress), so this is smooth without easing — and the easing was
+    // exactly what made the car hang in the air over a crest, lagging above the
+    // road as it dropped away.
     r.position.y = splineP.y + 0.02;
 
     // === COSMETIC ROLL + WHEEL STEER ===
