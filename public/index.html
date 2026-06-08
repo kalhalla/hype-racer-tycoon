@@ -672,7 +672,7 @@ import * as THREE from 'three';
 const STORAGE_KEY = 'hype_racer_tycoon_v1';
 const defaultState = {
   coins: 300, level: 1, xp: 0,
-  speedLvl: 2, handlingLvl: 0, rewardLvl: 0, // demo start: race one is winnable, upgrades still bite
+  speedLvl: 5, handlingLvl: 0, rewardLvl: 0, // demo start: quick out of the box (~160mph); upgrades still climb to ~200
   carFlavour: 0,
   bestTime: null,
   totalRaces: 0, totalWins: 0,
@@ -5681,7 +5681,7 @@ function setupRace() {
   racers.push(playerCar);
 
   // AI: difficulty scales gently with level (world units / sec)
-  const aiBase = 8.0 + Math.min(1.28, state.level * 0.192);   // above the player off the line for early challenge
+  const aiBase = 11.3 + Math.min(1.28, state.level * 0.192);  // matched to the demo-default car so race one is close, not a parade
   const otherFlavours = FLAVOURS.filter((_, i) => i !== state.carFlavour);
   const aiSlots = GRID_SLOTS.filter((_, i) => i !== playerSlotIdx);   // AI fill the rest, front to back
   for (let i = 0; i < 3; i++) {
