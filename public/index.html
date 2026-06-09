@@ -5675,13 +5675,13 @@ function setupRace() {
   const pSlot = GRID_SLOTS[playerSlotIdx];
   playerCar = initRacer(pMesh, pSlot.lat, pSlot.dt, true, {
     color: playerColor,
-    maxSpeed: 7.04 * upgradeMult('speed'), // -36% from original; corners demand braking
+    maxSpeed: 8.3 * upgradeMult('speed'), // higher straight-line speed; corners now demand hard braking
     handling: upgradeMult('handling')
   });
   racers.push(playerCar);
 
   // AI: difficulty scales gently with level (world units / sec)
-  const aiBase = 11.3 + Math.min(1.28, state.level * 0.192);  // matched to the demo-default car so race one is close, not a parade
+  const aiBase = 13.6 + Math.min(1.28, state.level * 0.192);  // faster AI: near the player's straight pace; slows more for corners (below)
   const otherFlavours = FLAVOURS.filter((_, i) => i !== state.carFlavour);
   const aiSlots = GRID_SLOTS.filter((_, i) => i !== playerSlotIdx);   // AI fill the rest, front to back
   for (let i = 0; i < 3; i++) {
@@ -5796,7 +5796,7 @@ const audio = (() => {
   // Idle / redline firing fundamentals and the speed that maps to redline. A
   // fully speed-upgraded car (maxSpeed ~9.3) sits near redline; a base car tops
   // out partway up the range, so speed upgrades audibly let the engine rev higher.
-  const IDLE_HZ = 90, REDLINE_HZ = 480, REV_REF = 7.04;   // tracks the lowered top speed
+  const IDLE_HZ = 90, REDLINE_HZ = 175, REV_REF = 7.04;   // wavetable: ~1-octave rise/fall (idle ~330Hz, redline ~645Hz)
 
   function makeNoiseBuffer(c) {
     const len = c.sampleRate * 2;
@@ -5806,13 +5806,35 @@ const audio = (() => {
     return buf;
   }
 
-  const ENGINE_REF_HZ = 100;   // the buffer's fundamental at playbackRate 1
+  const ENGINE_REF_HZ = 140;   // loop's native pitch sits near the top of the range; modest up-pitch is fine for a wavetable
+  const ENGINE_PCM_RATE = 48000;   // wavetable cut from F1_car_sound.m4a (native 48k, bright)
+  const ENGINE_PCM_B64 = "iOWE3kDauNdq1WvTJNO41S/b/eLM7Fn4rAQ/EPwZ9iH7KLcvZzYRPelDaUsVVEJeYGUMbtB1mXnQd3Bx3WjmX4pXPVHjTr5QH1RYVd9S802lSJ5DjD3fNLMpnx1aEhMJqAJn/yn+Y/zt92bwXuaR2RTJprXHop+UYY17jLyP8JROmtmdyZ3qmQiU4Y5PjGaMh47ykoKa6qTtr8K4+r0KwJfAS8G3wgHEkMM7wHO6orT3sTK0nbo0w2bMrtXP3tvmeexO71Hwv/Bv8e/yo/XS+ZH/wwYUD9AX0B8IJlgqsy3zMPUzgzaAOVk+eUWxTX5VplwAZM1r7HKwd/54cnaYcOZpeGXJY3li9V+EXUxdOF9mYHtdSVWLSX89yzO3LYwrRiwELQ0qGiHfEmcCpPKO5KXXusvdwWW7XrhJtzW2urMnr36ofaClmCKTCpLjlQyd1aT2qrSuCbF0s9u2o7u6wQvIb8wtzc3KoMf7xOzBGL0Gt/ixy69RsNexArPYswG11raKuWe9VsLKx3HNvdMl2+riFOno61TrRenJ6FHsTfQV/zUKORQqHZAlkC2aNPg53D0WQclDQEUURQ1EeEN1Q69CSUCFPfk8BkD3REJId0foQkQ9sTmLOYk7Hj3gPMI7nDvHPKE9HjycNyExvymdIfAY+hB+CzoJEAnlCBsHRAMX/sj42fOF7l/nb9080QzFaLuMtBKuJqZBnt+ZJpt6ocGqz7TdvfvEfsoMz9TRm9BIytLA67cRsnGvy67TrvmuUq/jryuwpq/ArtquR7Fotkq9xMNsxyTHQcRIwuTE0s1G3NPt7P/0EBogvyz8Nc86bjtDOss69D46RbBJn0m/RSlBJD+5QT9JLFT4XjZlTmR6XRdVkE8ITnxOIE9uUI1TUVfsV31SXkjiPWk2UDL7L+AtVSsXKP8jMR8eGk8VLBG5DVUKJgYIAXn7EPU87FDgFNOmxxXAQbzFuv+5MbgdtIWuWqrLqgCxSLtcxk/PMNSs07/NasSGurKxwKlRopycwZpmneuiBam2rl60BLp9vpfAesCgv7q/ksHtxAzJLc0b0YHVaduI4/ntIfqjBuMRABuJIgUqKDIaOWY7kTdiMPUqpCrFLhA0tDcEOR05wjkuPLdAEkcLTnJTdVW4VMtURFnIYfBpGm2GaapghFWySuhBHDxKOaA4LzkOOl06zDnSOJo35zQMLxcmMhz4E80OHAzpCUMGxgAG+w738fRt8kft";
 
   // One engine cycle as a looping buffer: a train of exhaust "blats" rather than a
   // steady oscillator. Each fundamental period has a quick attack and a decay (the
   // pulse) over a throaty harmonic body with a formant near the 4th harmonic. Two
   // periods are baked at slightly uneven level so the loop has a lumpy A/B firing
   // feel. Pitch is set later by playbackRate, so the pulses speed up with revs.
+  // Engine core voice: a steady, click-free loop cut from the supplied F1 recording
+  // (equal-power crossfade seam, mono 22.05k Int16 PCM). RPM still rides playbackRate
+  // exactly as before; this just swaps the synthetic cycle for the real car. Falls
+  // back to the synthesized buffer if the sample can't be decoded.
+  function makeEngineSample(c) {
+    try {
+      const bin = atob(ENGINE_PCM_B64);
+      const n = bin.length >> 1;
+      if (!n) return null;
+      const buf = c.createBuffer(1, n, ENGINE_PCM_RATE);
+      const d = buf.getChannelData(0);
+      for (let i = 0; i < n; i++) {
+        let v = bin.charCodeAt(i * 2) | (bin.charCodeAt(i * 2 + 1) << 8);
+        if (v >= 32768) v -= 65536;
+        d[i] = v / 32768;
+      }
+      return buf;
+    } catch (e) { return null; }
+  }
+
   function makeEngineBuffer(c) {
     const period = Math.round(c.sampleRate / ENGINE_REF_HZ);
     const len = period * 2;
@@ -5850,7 +5872,7 @@ const audio = (() => {
     master.gain.value = muted ? 0 : 0.85;
     master.connect(ctx.destination);
     noiseBuffer = makeNoiseBuffer(ctx);
-    engineBuf = makeEngineBuffer(ctx);
+    engineBuf = makeEngineSample(ctx) || makeEngineBuffer(ctx);
     buildSkidVoice();
     return ctx;
   }
@@ -5952,9 +5974,9 @@ const audio = (() => {
 
   // Per-frame update. Speed sets the firing fundamental (idle→redline), smoothed
   // for inertia; the filters open and the noise brightens with RPM/throttle.
-  function tick(dt, speed, throttling, steerMag) {
+  function tick(dt, speed, throttling, steerMag, topSpeed) {
     if (!ctx || engineState !== 'on' || !engSrc) return;
-    let rpm = Math.min(1, Math.max(0, speed / REV_REF));
+    let rpm = Math.min(1, Math.max(0, speed / (topSpeed || REV_REF)));   // revs span the car's real top speed
     // Launch rev: with the throttle open at low road speed the engine still
     // spins up (clutch slip / wheelspin), so the note climbs even when the car
     // isn't moving yet. Fades out by ~speed 6, kept monotonic into the speed map.
@@ -6313,17 +6335,20 @@ function updateRacers(dt) {
     // caps, turn radius (v / yaw) widens again as top speed climbs, so the
     // tightest corners still demand braking. Raise PEAK_SPEED to keep the climb
     // going higher; raise YAW_MAX for more overall bite.
-    const YAW_MAX = 1.7, PEAK_SPEED = 6, LOW_FRAC = 0.35;   // a touch less grip → wash wider, brake more
-    let yaw = YAW_MAX * Math.max(LOW_FRAC, Math.min(1, r.speed / PEAK_SPEED));
+    const YAW_MAX = 1.3, PEAK_SPEED = 6, LOW_FRAC = 0.35;   // a touch less grip → wash wider, brake more
+    const LAT_ACCEL = 8.0;   // grip-circle: the front can only hold yaw up to LAT_ACCEL / v
+    let yaw = YAW_MAX * Math.min(1, r.speed / PEAK_SPEED);   // scales from zero: a stopped car can't rotate
+    if (r.speed > 0.5) yaw = Math.min(yaw, LAT_ACCEL / r.speed);   // front washes wide at speed = understeer (lower LAT_ACCEL = more)
     if (r.lockedUp) yaw *= 0.12;       // locked front tyres wash out — almost no steering
-    r.heading += steer * yaw * dt * (r.handling || 1) * (r.gripMul || 1);   // gripMul drops to 0.5 with no front wing
+    const dTheta = steer * yaw * dt * (r.handling || 1) * (r.gripMul || 1);
+    r.heading += dTheta;   // gripMul drops to 0.5 with no front wing
 
     // Snap oversteer (player): with more grip you can lean on it harder, but
     // turning sharply at speed can break the rear loose without warning. A live
     // slideRate adds extra rotation in the turn direction; lift or counter-steer
     // to catch it, hold the turn into it and it builds toward a spin.
     if (r.isPlayer) {
-      const OVERSTEER_SPEED = 8;          // only when really pushing
+      const OVERSTEER_SPEED = 11;         // calmer rear: only steps out at real speed
       r.slideRate = r.slideRate || 0;
       if (Math.abs(steer) > 0.85 && r.speed > OVERSTEER_SPEED && Math.abs(r.slideRate) < 0.3 && !r.lockedUp) {
         const load = Math.min(1, (r.speed - OVERSTEER_SPEED) / Math.max(0.5, r.maxSpeed - OVERSTEER_SPEED));
@@ -6344,6 +6369,23 @@ function updateRacers(dt) {
       r.sliding = Math.abs(r.slideRate) > 0.4;
     }
 
+    // === LOW-SPEED POWER-OVERSTEER (player): doughnuts ===
+    // Grip-yaw is zero at a standstill (above), so steering alone can't rotate a
+    // parked car. Bury the throttle while turning at low speed and the rears spin
+    // up, the back steps out, and the car rotates in a cloud of smoke. Falls off
+    // above SPIN_SPEED, where the tyres hook up and grip takes over. SPIN_YAW is
+    // how hard it spins; SPIN_SPEED is how fast you can go and still break loose.
+    const SPIN_SPEED = 5, SPIN_YAW = 3.0;
+    r.spin = (r.isPlayer && gas && !braking) ? Math.max(0, 1 - r.speed / SPIN_SPEED) : 0;
+    if (r.spin > 0.01 && Math.abs(steer) > 0.15) {
+      const spinRot = Math.sign(steer) * r.spin * SPIN_YAW * dt;
+      r.heading += spinRot;                        // rear steps out
+      r.slip = (r.slip || 0) + r.speed * spinRot;  // body slides wide
+      r.sliding = true;                            // tyre-scrub audio + rear smoke
+    }
+    r.wheelspin = r.isPlayer && gas && !braking &&
+                  (r.speed < 1 || (r.spin > 0.05 && Math.abs(steer) > 0.15));
+
     // === SPEED UPDATE ===
     let target, rate;
     if (r.finished) {
@@ -6361,27 +6403,46 @@ function updateRacers(dt) {
       }
       else if (gas) { target = r.maxSpeed; rate = 2; }   // no auto-lift: brake yourself
       else { target = 0; rate = 0.5; }
-      // Launch wheelspin: full throttle from low speed lights up the rears.
-      r.wheelspin = gas && !braking && r.speed < 1;
+      // (wheelspin / power-oversteer set in the heading block above)
     } else {
       // AI: lift for upcoming curvature, but carry far more corner speed than before
       // so it laps quicker and pressures the player early (cap 0.5 = slows to 50% in
       // hairpins, not 35%). It follows the line and its steering grows with speed, so
       // the extra pace doesn't make it run wide.
-      const curveSlow = 1 - Math.min(0.5, estimateCurvature((r.splineProgress + 0.02) % 1) * 9);
+      const curveSlow = 1 - Math.min(0.88, estimateCurvature((r.splineProgress + 0.02) % 1) * 9 * (1.2 / YAW_MAX));
       target = r.maxSpeed * curveSlow;
       rate = 2.2;   // pulls out of corners harder than the player (rate 2.0)
     }
-    if (r.wheelspin) rate *= 0.2;   // traction-limited launch — the car spins before it hooks up
+    if (r.spin > 0.05 && Math.abs(steer) > 0.15) rate *= Math.max(0.07, 1 - r.spin);  // doughnut: rears spinning, barely drives forward
+    else if (r.wheelspin) rate *= 0.2;   // traction-limited launch — the car spins before it hooks up
     r.speed += (target - r.speed) * Math.min(1, dt * rate);
     r.speed = Math.max(0, r.speed);
     if (r.isPlayer && r.sliding) r.speed *= (1 - Math.min(0.5, dt));   // a slide scrubs speed
 
-    // === POSITION UPDATE (forward along heading) ===
-    const forwardX = -Math.sin(r.heading);
-    const forwardZ = Math.cos(r.heading);
-    r.position.x += forwardX * r.speed * dt;
-    r.position.z += forwardZ * r.speed * dt;
+    // === LATERAL SLIP (the real low-grip feel) ===
+    // Turning rotates the nose faster than grip can swing the car's momentum, so the body
+    // carries toward the outside of the corner. LAT_GRIP claws it back: LOWER = looser /
+    // slidier / more drift, HIGHER = planted. A big slide also bleeds speed. Straighten or
+    // counter-steer (which flips dTheta) to gather it up.
+    const LAT_GRIP = 4.0;
+    r.slip = (r.slip || 0) + r.speed * dTheta;                       // momentum lag from this turn
+    r.slip *= Math.max(0, 1 - LAT_GRIP * dt);                        // tyres claw the slide back
+    r.speed *= (1 - Math.min(0.4, Math.abs(r.slip) * 0.15 * dt));    // a slide scrubs speed
+    if (Math.abs(r.slip) > 1.2) r.sliding = true;                    // drive the tyre-scrub audio
+
+    // === POSITION UPDATE (forward + lateral slip, sub-stepped so a fast car can't tunnel) ===
+    const forwardX = -Math.sin(r.heading), forwardZ = Math.cos(r.heading);
+    const perpX = Math.cos(r.heading), perpZ = Math.sin(r.heading);   // car's right
+    const dispX = (forwardX * r.speed + perpX * r.slip) * dt;
+    const dispZ = (forwardZ * r.speed + perpZ * r.slip) * dt;
+    const moveLen = Math.hypot(dispX, dispZ);
+    const subN = Math.max(1, Math.ceil(moveLen / 0.22));   // each hop stays well under CAR_R (0.32)
+    const subX = dispX / subN, subZ = dispZ / subN;
+    for (let ss = 0; ss < subN; ss++) {
+      r.position.x += subX;
+      r.position.z += subZ;
+      checkWallCollisions(r, dt);   // catch the wall mid-move instead of punching through it
+    }
 
     // === SPLINE PROGRESS + GROUND HEIGHT ===
     updateSplineProgress(r);
@@ -6435,7 +6496,7 @@ function updateRacers(dt) {
 
   if (playerCar && !playerCar.finished) {
     const steerMag = Math.abs((steerRight ? 1 : 0) - (steerLeft ? 1 : 0));
-    audio.tick(dt, playerCar.speed, gas, steerMag);
+    audio.tick(dt, playerCar.speed, gas, steerMag, playerCar.maxSpeed);
   }
 }
 
