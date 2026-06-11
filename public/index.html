@@ -433,6 +433,18 @@ button.primary.go:active { transform: skewX(-10deg) translate(3px, 3px); box-sha
 .cam-fab.cam-on { background: var(--hype-green); border-color: var(--hype-green-deep); }
 .cam-fab.cam-on svg { fill: var(--hype-black); }
 @media (max-width: 600px) { .cam-fab { width: 52px; height: 52px; top: 132px; } .cam-fab svg { width: 26px; height: 26px; } }
+/* Tilt-steering FAB sits just below the free-camera FAB. */
+#btn-tilt { top: 218px; }
+@media (max-width: 600px) { #btn-tilt { top: 192px; } }
+.tilt-toast {
+  position: fixed; left: 50%; bottom: 170px; transform: translateX(-50%);
+  z-index: 30; background: var(--hype-black-deep); color: var(--hype-green);
+  padding: 9px 16px; border-radius: 8px; box-shadow: 4px 4px 0 var(--hype-green-deep);
+  font-family: 'Nunito', sans-serif; font-weight: 800; font-size: 13px;
+  max-width: 86vw; text-align: center;
+  opacity: 0; transition: opacity 0.35s; pointer-events: none;
+}
+.tilt-toast.show { opacity: 1; }
 
 /* Damage warning banner — fades in on a wing loss, auto-hides */
 #damage-warning {
@@ -455,6 +467,12 @@ button.primary.go:active { transform: skewX(-10deg) translate(3px, 3px); box-sha
 </button>
 <button class="cam-fab" id="btn-freecam" title="Free camera (drag to look around, pinch to zoom)" aria-label="Toggle free camera">
   <svg viewBox="0 0 24 24"><path d="M9 4 L7.5 6 H4 a2 2 0 0 0 -2 2 v10 a2 2 0 0 0 2 2 h16 a2 2 0 0 0 2 -2 V8 a2 2 0 0 0 -2 -2 h-3.5 L15 4 Z M12 9.5 a3.5 3.5 0 1 0 0 7 a3.5 3.5 0 1 0 0 -7 Z M19 8 a0.8 0.8 0 1 0 0 1.6 a0.8 0.8 0 1 0 0 -1.6 Z"/></svg>
+</button>
+<button class="cam-fab" id="btn-tilt" title="Tilt steering (steer by tilting your phone)" aria-label="Toggle tilt steering">
+  <svg viewBox="0 0 24 24" style="transform:rotate(-20deg)">
+    <path fill-rule="evenodd" d="M8 1.5 h8 a2.5 2.5 0 0 1 2.5 2.5 v16 a2.5 2.5 0 0 1 -2.5 2.5 h-8 a2.5 2.5 0 0 1 -2.5 -2.5 v-16 a2.5 2.5 0 0 1 2.5 -2.5 Z M7.5 4.6 h9 v12.9 h-9 Z"/>
+    <path d="M12 21.1 a1 1 0 1 0 0 -2 a1 1 0 0 0 0 2 Z"/>
+  </svg>
 </button>
 <div id="damage-warning"></div>
 
@@ -1007,6 +1025,62 @@ window.addEventListener('wheel', (e) => {
 renderer.domElement.style.touchAction = 'none';
 
 const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 200);
+scene.add(camera);   // so camera-parented wind streaks render
+var camFov = 50;     // current lens, lerped toward the speed-kick target
+
+/* Wind streaks: thin additive lines parented to the camera, visible only near
+   top speed. Living in camera space means zero per-frame world math; we just
+   scroll z and wrap. Radius keeps them clear of the screen centre so the car
+   stays clean. */
+var windStreaks = (function () {
+  const N = 34;
+  const pos = new Float32Array(N * 6);
+  const seg = [];
+  for (let i = 0; i < N; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const rr = 0.55 + Math.random() * 1.15;
+    seg.push({
+      x: Math.cos(a) * rr, y: Math.sin(a) * rr * 0.65,
+      z: -9 + Math.random() * 10,
+      len: 0.8 + Math.random() * 1.2,
+      sp: 8 + Math.random() * 6
+    });
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const m = new THREE.LineBasicMaterial({
+    color: 0xffffff, transparent: true, opacity: 0,
+    blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false
+  });
+  const lines = new THREE.LineSegments(g, m);
+  lines.frustumCulled = false;
+  lines.renderOrder = 999;
+  camera.add(lines);
+  return { seg, lines, pos, level: 0 };
+})();
+function updateWindStreaks(dt, frac, active) {
+  const w = windStreaks;
+  const targetLevel = active ? Math.max(0, (frac - 0.55) / 0.45) : 0;
+  w.level += (targetLevel - w.level) * Math.min(1, dt * 6);
+  w.lines.material.opacity = w.level * 0.65;
+  if (w.level < 0.02) { w.lines.visible = false; return; }
+  w.lines.visible = true;
+  const p = w.pos;
+  for (let i = 0; i < w.seg.length; i++) {
+    const s = w.seg[i];
+    s.z += (s.sp + 6) * frac * dt * 2.2;
+    if (s.z - s.len > 0.6) {
+      s.z = -9 - Math.random() * 3;
+      const a = Math.random() * Math.PI * 2;
+      const rr = 0.55 + Math.random() * 1.15;
+      s.x = Math.cos(a) * rr; s.y = Math.sin(a) * rr * 0.65;
+    }
+    const o = i * 6;
+    p[o] = s.x;     p[o + 1] = s.y; p[o + 2] = s.z;
+    p[o + 3] = s.x; p[o + 4] = s.y; p[o + 5] = s.z - s.len;
+  }
+  w.lines.geometry.attributes.position.needsUpdate = true;
+}
 
 function resize() {
   const w = window.innerWidth, h = window.innerHeight;
@@ -5770,6 +5844,124 @@ function setupTouchControls() {
 setupTouchControls();
 
 /* =====================================================
+   TILT STEERING  (device orientation -> analog steer)
+   Toggled by the phone FAB. iOS 13+ requires an explicit
+   permission grant that must come from a user tap; the
+   FAB tap is that gesture. While tilt drives, the steer
+   buttons hide (pedals stay). Neutral is captured at
+   enable time, so whatever angle the phone is held at
+   becomes straight ahead. A watchdog falls back to
+   buttons if the sensor never reports (desktop browsers
+   define the event but fire nothing).
+===================================================== */
+var TILT_DEAD  = 2.0;   // degrees of slack around neutral
+var TILT_RANGE = 20;    // degrees from neutral for full lock
+var tilt = { on: false, raw: null, zero: null, val: 0, enabledAt: 0 };
+
+function tiltToast(msg) {
+  let el = document.getElementById('tilt-toast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'tilt-toast'; el.className = 'tilt-toast';
+    document.body.appendChild(el);
+  }
+  el.textContent = msg; el.classList.add('show');
+  clearTimeout(tiltToast._t);
+  tiltToast._t = setTimeout(() => el.classList.remove('show'), 2400);
+}
+function tiltAngleFrom(e) {
+  if (e.gamma == null && e.beta == null) return null;
+  let a = 0;
+  try {
+    a = (screen.orientation && typeof screen.orientation.angle === 'number')
+      ? screen.orientation.angle : (window.orientation || 0);
+  } catch (_) {}
+  if (a === 90) return e.beta;                 // landscape, home right
+  if (a === -90 || a === 270) return -e.beta;  // landscape, home left
+  if (a === 180) return -e.gamma;              // upside down
+  return e.gamma;                              // portrait
+}
+function onTiltEvent(e) {
+  const t = tiltAngleFrom(e);
+  if (t == null) return;
+  tilt.raw = t;
+  if (tilt.zero == null) tilt.zero = t;   // first reading after enable = neutral grip
+}
+function setTilt(on, quiet) {
+  tilt.on = on; tilt.zero = null; tilt.raw = null; tilt.val = 0;
+  tilt.enabledAt = performance.now();
+  const fab = document.getElementById('btn-tilt');
+  if (fab) fab.classList.toggle('cam-on', on);
+  const sl = document.getElementById('btn-steer-left');
+  const sr = document.getElementById('btn-steer-right');
+  if (sl) sl.style.visibility = on ? 'hidden' : '';
+  if (sr) sr.style.visibility = on ? 'hidden' : '';
+  try { localStorage.setItem('hypeTiltSteer', on ? '1' : '0'); } catch (_) {}
+  if (on) {
+    window.addEventListener('deviceorientation', onTiltEvent);
+    if (!quiet) tiltToast('Tilt steering ON. Hold the phone comfortably: that is straight ahead.');
+  } else {
+    window.removeEventListener('deviceorientation', onTiltEvent);
+    if (!quiet) tiltToast('Tilt steering off');
+  }
+}
+function requestTilt() {
+  if (tilt.on) { setTilt(false); return; }
+  const D = window.DeviceOrientationEvent;
+  if (!D) { tiltToast('No tilt sensor on this device'); return; }
+  // Sandboxed iframes (artifact previews, embeds) can never be granted motion
+  // sensors -- the OS prompt does not even appear. Name the real problem.
+  let framed = false;
+  try { framed = window.self !== window.top; } catch (_) { framed = true; }
+  const denyMsg = framed
+    ? 'Tilt is blocked inside embedded previews. Open the site directly in your browser.'
+    : 'Tilt permission denied';
+  if (typeof D.requestPermission === 'function') {
+    D.requestPermission()
+      .then(r => { if (r === 'granted') setTilt(true); else tiltToast(denyMsg); })
+      .catch(() => tiltToast(denyMsg));
+  } else {
+    setTilt(true);
+  }
+}
+(function initTiltFab() {
+  const fab = document.getElementById('btn-tilt');
+  if (!fab) return;
+  const touch = ('ontouchstart' in window) || ((navigator.maxTouchPoints || 0) > 0);
+  if (!touch) { fab.style.display = 'none'; return; }   // pointless on desktop
+  fab.addEventListener('click', requestTilt);
+  let saved = null;
+  try { saved = localStorage.getItem('hypeTiltSteer'); } catch (_) {}
+  if (saved === '1') {
+    // Re-arm on the first tap anywhere; a tap satisfies the iOS gesture rule.
+    const once = (e) => {
+      window.removeEventListener('pointerdown', once, true);
+      if (e.target && e.target.closest && e.target.closest('#btn-tilt')) return;
+      requestTilt();
+    };
+    window.addEventListener('pointerdown', once, true);
+  }
+})();
+// Smoothed analog steer, advanced once per frame from animate().
+function updateTilt(dt) {
+  if (!tilt.on) return;
+  if (tilt.raw == null) {   // enabled but the sensor never spoke
+    if (performance.now() - tilt.enabledAt > 2500) {
+      setTilt(false, true); tiltToast('No tilt data. Using buttons.');
+    }
+    return;
+  }
+  const d = tilt.raw - tilt.zero;
+  const mag = Math.max(0, Math.abs(d) - TILT_DEAD) / (TILT_RANGE - TILT_DEAD);
+  const target = Math.max(-1, Math.min(1, Math.sign(d) * mag));
+  tilt.val += (target - tilt.val) * Math.min(1, dt * 14);
+}
+function playerSteerInput() {
+  if (tilt.on && tilt.raw != null && tilt.zero != null) return tilt.val;
+  return (steerRight ? 1 : 0) - (steerLeft ? 1 : 0);
+}
+
+/* =====================================================
    AUDIO  (fully procedural Web Audio — no external assets)
    Engine: a custom-spectrum oscillator + detuned twin (beating) + half-order
    sub (lumpy rumble) + noise turbulence, summed through a throttle-driven
@@ -6309,7 +6501,7 @@ function updateRacers(dt) {
     if (r.finished) {
       steer = 0; // coast straight — no input, no AI pursuit
     } else if (r.isPlayer) {
-      steer = (steerRight ? 1 : 0) - (steerLeft ? 1 : 0);
+      steer = playerSteerInput();
     } else {
       // Pure-pursuit: aim at a point on the spline some distance ahead
       const lookAheadT = (r.splineProgress + 0.04) % 1;
@@ -6506,6 +6698,17 @@ function updateCamera(dt) {
   const isRacing = raceState === 'racing' || raceState === 'countdown';
   const isFinishing = raceState === 'finishing';
 
+  // === SPEED FEEL: dynamic FOV ===
+  // Widening the lens with speed is the classic arcade speed cue; the curve
+  // keeps it invisible below half throttle and dramatic at the limiter.
+  // Showcase, orbit cam, podium, finishing beauty shot and menus sit at 50.
+  const chase = raceState === 'racing' && !(showcase && showcase.on) && !orbitCam.on && playerCar;
+  const sFrac = chase ? Math.min(1, playerCar.speed / Math.max(0.001, playerCar.maxSpeed)) : 0;
+  const fovTarget = 50 + (chase ? 16 * Math.pow(sFrac, 1.6) : 0);
+  camFov += (fovTarget - camFov) * Math.min(1, dt * 5);
+  if (Math.abs(camera.fov - camFov) > 0.01) { camera.fov = camFov; camera.updateProjectionMatrix(); }
+  updateWindStreaks(dt, sFrac, !!chase);
+
   // Keep the shadow frustum centred on the player so shadows don't drop out on
   // far parts of the circuit (they used to vanish before the tunnel — the fixed
   // ±22 shadow camera simply didn't reach that far from the world origin).
@@ -6607,6 +6810,7 @@ function animate() {
   requestAnimationFrame(animate);
   const _rawDelta = clock.getDelta();
   const dt = Math.min(_rawDelta, 0.05);
+  updateTilt(dt);
   if (SHOW_FPS) {
     const _inst = _rawDelta > 0 ? 1 / _rawDelta : 60;
     _fpsSmooth += (_inst - _fpsSmooth) * 0.1;   // EMA so the number is readable
@@ -6630,7 +6834,7 @@ function animate() {
   let skidNow = false, skidHeavy = false;
   if (raceState === 'racing' && playerCar) {
     const pc = playerCar;
-    const steerIn = (steerRight ? 1 : 0) - (steerLeft ? 1 : 0);
+    const steerIn = playerSteerInput();
     // Front understeer must BUILD UP: only sustained hard cornering near top
     // speed counts as real grip loss — with on/off steering, a brief turn at
     // pace shouldn't smoke. Wheelspin: rears overpowered at launch.
