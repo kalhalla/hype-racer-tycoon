@@ -240,7 +240,7 @@ button.primary.go:active { transform: skewX(-10deg) translate(3px, 3px); box-sha
 .controls {
   position: fixed; bottom: max(env(safe-area-inset-bottom), 16px);
   left: 16px; right: 16px; z-index: 12;
-  display: none; justify-content: space-between; align-items: flex-end;
+  display: none; justify-content: flex-end; align-items: flex-end;
   pointer-events: none;
 }
 .controls.active { display: flex; }
@@ -260,6 +260,26 @@ button.primary.go:active { transform: skewX(-10deg) translate(3px, 3px); box-sha
 .ctrl-btn.gas.pressed { background: rgba(164, 225, 50, 0.95); }
 .ctrl-btn.brake { background: rgba(230, 57, 70, 0.55); border-color: rgba(230, 57, 70, 0.9); }
 .ctrl-btn.brake.pressed { background: rgba(230, 57, 70, 0.9); }
+/* On-screen steering wheel: decorative live readout of steer input. Centre
+   slot of the control row; never eats touches (pointer-events:none). */
+#steer-wheel {
+  position: fixed; left: 50%; bottom: max(env(safe-area-inset-bottom), 16px);
+  transform: translateX(-50%);
+  width: 78px; height: 78px; z-index: 12;
+  pointer-events: none; opacity: 0.92; display: none;
+  filter: drop-shadow(3px 3px 0 var(--hype-green-deep));
+}
+#steer-wheel svg { width: 100%; height: 100%; display: block; }
+#wheel-rot { transform-box: fill-box; transform-origin: center; }
+@media (max-width: 600px) { #steer-wheel { width: 64px; height: 64px; } }
+/* Invisible touch-drag steering zone: the lower band of the screen. A
+   relative drag from where the thumb lands maps to analog steer. Above the
+   canvas but below the pedals (z12); hidden during free-cam so orbit drag
+   passes straight through to the canvas. */
+#steer-zone {
+  position: fixed; left: 0; right: 0; bottom: 0; height: 46%;
+  z-index: 11; display: none; pointer-events: auto; touch-action: none;
+}
 
 #countdown {
   position: fixed; inset: 0; z-index: 20;
@@ -602,10 +622,19 @@ button.primary.go:active { transform: skewX(-10deg) translate(3px, 3px); box-sha
   <div class="race-mid"></div>
 </div>
 
+<div id="steer-zone" aria-hidden="true"></div>
 <div class="controls" id="controls">
-  <div class="ctrl-pair">
-    <button class="ctrl-btn" id="btn-steer-left">◀</button>
-    <button class="ctrl-btn" id="btn-steer-right">▶</button>
+  <div id="steer-wheel" aria-hidden="true">
+    <svg viewBox="0 0 100 100">
+      <g id="wheel-rot">
+        <circle cx="50" cy="50" r="45" fill="#0A0A0A" stroke="#A4E132" stroke-width="7"/>
+        <rect x="46.5" y="6" width="7" height="38" rx="3.5" fill="#7DB322"/>
+        <rect x="46.5" y="6" width="7" height="38" rx="3.5" fill="#7DB322" transform="rotate(120 50 50)"/>
+        <rect x="46.5" y="6" width="7" height="38" rx="3.5" fill="#7DB322" transform="rotate(240 50 50)"/>
+        <circle cx="50" cy="50" r="13" fill="#0A0A0A" stroke="#A4E132" stroke-width="5"/>
+        <rect x="41.5" y="-1.5" width="17" height="15" rx="3.5" fill="#ffffff" stroke="#0A0A0A" stroke-width="1.6"/>
+      </g>
+    </svg>
   </div>
   <div class="ctrl-pair">
     <button class="ctrl-btn brake" id="btn-brake">■</button>
@@ -623,7 +652,7 @@ button.primary.go:active { transform: skewX(-10deg) translate(3px, 3px); box-sha
 </div>
 
 <div id="controls-hint">
-  <span>Hold <b>▲</b> to go &nbsp;·&nbsp; <b>◀ ▶</b> to steer &nbsp;·&nbsp; <b>■</b> to brake</span>
+  <span>Hold <b>▲</b> to go &nbsp;·&nbsp; <b>drag</b> the lower screen to steer &nbsp;·&nbsp; <b>■</b> to brake</span>
   <span class="kbd">on desktop: arrow keys or WASD &nbsp;·&nbsp; space = go</span>
 </div>
 
@@ -1028,59 +1057,77 @@ const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 200);
 scene.add(camera);   // so camera-parented wind streaks render
 var camFov = 50;     // current lens, lerped toward the speed-kick target
 
-/* Wind streaks: thin additive lines parented to the camera, visible only near
-   top speed. Living in camera space means zero per-frame world math; we just
-   scroll z and wrap. Radius keeps them clear of the screen centre so the car
-   stays clean. */
-var windStreaks = (function () {
-  const N = 34;
-  const pos = new Float32Array(N * 6);
-  const seg = [];
-  for (let i = 0; i < N; i++) {
-    const a = Math.random() * Math.PI * 2;
-    const rr = 0.55 + Math.random() * 1.15;
-    seg.push({
-      x: Math.cos(a) * rr, y: Math.sin(a) * rr * 0.65,
-      z: -9 + Math.random() * 10,
-      len: 0.8 + Math.random() * 1.2,
-      sp: 8 + Math.random() * 6
-    });
+/* Underbody sparks: warm additive sprites struck off the car floor at speed --
+   the look of a low ride height kissing the tarmac. Pooled and recycled, no
+   external assets. Emission (rate + direction) is driven from animate() where
+   the car's speed and heading live; this object just spawns and ages them. */
+const sparks = (() => {
+  const cnv = document.createElement('canvas'); cnv.width = cnv.height = 32;
+  const g = cnv.getContext('2d');
+  const grad = g.createRadialGradient(16, 16, 0, 16, 16, 16);
+  grad.addColorStop(0.0, 'rgba(255,255,255,1)');
+  grad.addColorStop(0.35, 'rgba(255,235,150,1)');
+  grad.addColorStop(0.75, 'rgba(255,140,30,0.7)');
+  grad.addColorStop(1.0, 'rgba(255,110,0,0)');
+  g.fillStyle = grad; g.fillRect(0, 0, 32, 32);
+  const tex = new THREE.CanvasTexture(cnv);
+
+  const POOL = 90;
+  const pool = [];
+  for (let i = 0; i < POOL; i++) {
+    const s = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: tex, transparent: true, opacity: 0, depthWrite: false,
+      blending: THREE.AdditiveBlending
+    }));
+    s.visible = false;
+    scene.add(s);
+    pool.push(s);
   }
-  const g = new THREE.BufferGeometry();
-  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-  const m = new THREE.LineBasicMaterial({
-    color: 0xffffff, transparent: true, opacity: 0,
-    blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false
-  });
-  const lines = new THREE.LineSegments(g, m);
-  lines.frustumCulled = false;
-  lines.renderOrder = 999;
-  camera.add(lines);
-  return { seg, lines, pos, level: 0 };
-})();
-function updateWindStreaks(dt, frac, active) {
-  const w = windStreaks;
-  const targetLevel = active ? Math.max(0, (frac - 0.55) / 0.45) : 0;
-  w.level += (targetLevel - w.level) * Math.min(1, dt * 6);
-  w.lines.material.opacity = w.level * 0.65;
-  if (w.level < 0.02) { w.lines.visible = false; return; }
-  w.lines.visible = true;
-  const p = w.pos;
-  for (let i = 0; i < w.seg.length; i++) {
-    const s = w.seg[i];
-    s.z += (s.sp + 6) * frac * dt * 2.2;
-    if (s.z - s.len > 0.6) {
-      s.z = -9 - Math.random() * 3;
-      const a = Math.random() * Math.PI * 2;
-      const rr = 0.55 + Math.random() * 1.15;
-      s.x = Math.cos(a) * rr; s.y = Math.sin(a) * rr * 0.65;
+  let cur = 0;
+
+  // pos: world spawn point. back/side: world unit dirs. frac: speed/topSpeed,
+  // which sets how hard the sparks are flung off the back.
+  function emit(pos, back, side, frac) {
+    const s = pool[cur]; cur = (cur + 1) % POOL;
+    s.visible = true;
+    s.position.copy(pos);
+    const life = 0.12 + Math.random() * 0.18;
+    s.userData.life = life; s.userData.maxLife = life;
+    const sz = 0.035 + Math.random() * 0.045;
+    s.userData.size = sz; s.scale.setScalar(sz);
+    const bspd = 3.5 + 4.5 * frac;                 // unit-safe backward speed
+    const spread = (Math.random() - 0.5) * 3.0;
+    s.userData.vx = back.x * bspd + side.x * spread;
+    s.userData.vy = back.y * bspd + side.y * spread + 1.0 + Math.random() * 1.6;
+    s.userData.vz = back.z * bspd + side.z * spread;
+    s.material.opacity = 1;
+  }
+
+  function update(dt) {
+    for (const s of pool) {
+      if (!s.visible) continue;
+      s.userData.life -= dt;
+      if (s.userData.life <= 0) { s.visible = false; s.material.opacity = 0; continue; }
+      s.userData.vy -= 9.0 * dt;                   // gravity
+      s.position.x += s.userData.vx * dt;
+      s.position.y += s.userData.vy * dt;
+      s.position.z += s.userData.vz * dt;
+      if (s.position.y < 0.03) {                   // skip off the tarmac
+        s.position.y = 0.03;
+        s.userData.vy = Math.abs(s.userData.vy) * 0.3;
+        s.userData.vx *= 0.55; s.userData.vz *= 0.55;
+      }
+      const f = s.userData.life / s.userData.maxLife;
+      s.material.opacity = f;
+      s.scale.setScalar(s.userData.size * (0.4 + 0.6 * f));
     }
-    const o = i * 6;
-    p[o] = s.x;     p[o + 1] = s.y; p[o + 2] = s.z;
-    p[o + 3] = s.x; p[o + 4] = s.y; p[o + 5] = s.z - s.len;
   }
-  w.lines.geometry.attributes.position.needsUpdate = true;
-}
+  return { emit, update };
+})();
+const _sparkQ = new THREE.Quaternion();
+const _sparkBack = new THREE.Vector3();
+const _sparkSide = new THREE.Vector3();
+const _sparkPos = new THREE.Vector3();
 
 function resize() {
   const w = window.innerWidth, h = window.innerHeight;
@@ -5822,8 +5869,6 @@ function setupTouchControls() {
     el.addEventListener('mouseup', off);
     el.addEventListener('mouseleave', off);
   };
-  bindHold('btn-steer-left',  v => steerLeft = v);
-  bindHold('btn-steer-right', v => steerRight = v);
   bindHold('btn-gas',          v => gas = v);
   bindHold('btn-brake',        v => braking = v);
   window.addEventListener('keydown', e => {
@@ -5956,10 +6001,60 @@ function updateTilt(dt) {
   const target = Math.max(-1, Math.min(1, Math.sign(d) * mag));
   tilt.val += (target - tilt.val) * Math.min(1, dt * 14);
 }
+/* Touch-drag steering: one finger anywhere in the lower zone, slide left or
+   right of where it landed. Relative origin per gesture, so the thumb never
+   has to hunt for a fixed control. Priority: tilt > drag > keyboard. */
+var dragSteer = { active: false, id: null, originX: 0, val: 0, full: 90 };
 function playerSteerInput() {
   if (tilt.on && tilt.raw != null && tilt.zero != null) return tilt.val;
-  return (steerRight ? 1 : 0) - (steerLeft ? 1 : 0);
+  if (dragSteer.active) return dragSteer.val;
+  return (steerRight ? 1 : 0) - (steerLeft ? 1 : 0);   // keyboard on desktop
 }
+// On-screen wheel mirrors live steer input (tilt, drag OR keys): visible
+// proof the input is alive, and motion at speed. Its own lerp gives the
+// wheel weight so a flick swings it smoothly rather than snapping. The same
+// show-gate drives the drag zone, so free-cam frees the canvas for orbit.
+var MAX_WHEEL_DEG = 110;
+var wheelDisp = 0;
+function updateWheelHud(dt) {
+  const el = document.getElementById('steer-wheel');
+  const rot = document.getElementById('wheel-rot');
+  const zone = document.getElementById('steer-zone');
+  const show = raceState === 'racing' && !(showcase && showcase.on) && !orbitCam.on;
+  if (zone) { const d = show ? 'block' : 'none'; if (zone.style.display !== d) zone.style.display = d; }
+  if (!el || !rot) return;
+  if (!show) { if (el.style.display !== 'none') el.style.display = 'none'; return; }
+  if (el.style.display !== 'block') el.style.display = 'block';
+  const target = playerSteerInput() * MAX_WHEEL_DEG;
+  wheelDisp += (target - wheelDisp) * Math.min(1, dt * 12);
+  rot.style.transform = 'rotate(' + wheelDisp.toFixed(1) + 'deg)';
+}
+(function initDragSteer() {
+  const zone = document.getElementById('steer-zone');
+  if (!zone) return;
+  const recalc = () => Math.min(150, Math.max(70, window.innerWidth * 0.22));
+  zone.addEventListener('pointerdown', (e) => {
+    if (dragSteer.active) return;
+    dragSteer.active = true; dragSteer.id = e.pointerId;
+    dragSteer.originX = e.clientX; dragSteer.val = 0;
+    dragSteer.full = recalc();
+    try { zone.setPointerCapture(e.pointerId); } catch (_) {}
+    e.preventDefault();
+  });
+  zone.addEventListener('pointermove', (e) => {
+    if (!dragSteer.active || e.pointerId !== dragSteer.id) return;
+    const dx = e.clientX - dragSteer.originX;
+    dragSteer.val = Math.max(-1, Math.min(1, dx / dragSteer.full));
+    e.preventDefault();
+  });
+  const end = (e) => {
+    if (e.pointerId !== dragSteer.id) return;
+    dragSteer.active = false; dragSteer.id = null; dragSteer.val = 0;
+    try { zone.releasePointerCapture(e.pointerId); } catch (_) {}
+  };
+  zone.addEventListener('pointerup', end);
+  zone.addEventListener('pointercancel', end);
+})();
 
 /* =====================================================
    AUDIO  (fully procedural Web Audio — no external assets)
@@ -6687,7 +6782,7 @@ function updateRacers(dt) {
   updateRaceHUD();
 
   if (playerCar && !playerCar.finished) {
-    const steerMag = Math.abs((steerRight ? 1 : 0) - (steerLeft ? 1 : 0));
+    const steerMag = Math.abs(playerSteerInput());
     audio.tick(dt, playerCar.speed, gas, steerMag, playerCar.maxSpeed);
   }
 }
@@ -6707,7 +6802,6 @@ function updateCamera(dt) {
   const fovTarget = 50 + (chase ? 16 * Math.pow(sFrac, 1.6) : 0);
   camFov += (fovTarget - camFov) * Math.min(1, dt * 5);
   if (Math.abs(camera.fov - camFov) > 0.01) { camera.fov = camFov; camera.updateProjectionMatrix(); }
-  updateWindStreaks(dt, sFrac, !!chase);
 
   // Keep the shadow frustum centred on the player so shadows don't drop out on
   // far parts of the circuit (they used to vanish before the tunnel — the fixed
@@ -6811,6 +6905,7 @@ function animate() {
   const _rawDelta = clock.getDelta();
   const dt = Math.min(_rawDelta, 0.05);
   updateTilt(dt);
+  updateWheelHud(dt);
   if (SHOW_FPS) {
     const _inst = _rawDelta > 0 ? 1 / _rawDelta : 60;
     _fpsSmooth += (_inst - _fpsSmooth) * 0.1;   // EMA so the number is readable
@@ -6831,6 +6926,25 @@ function animate() {
   // Tyre smoke + skid while the player is locked up under braking
   smoke.update(dt);
   updateDebris(dt);
+  sparks.update(dt);
+  // Underbody sparks: independent of skids, rate ramps across the top half
+  // of the speed range. Struck from the rear floor, flung backward and down.
+  if (raceState === 'racing' && playerCar && playerCar.speed > 0.001) {
+    const sfrac = Math.min(1, playerCar.speed / Math.max(0.001, playerCar.maxSpeed));
+    if (sfrac > 0.5) {
+      const m = playerCar.mesh; m.updateMatrixWorld(true);
+      m.getWorldQuaternion(_sparkQ);
+      _sparkBack.set(0, 0, -1).applyQuaternion(_sparkQ);
+      _sparkSide.set(1, 0, 0).applyQuaternion(_sparkQ);
+      const intensity = (sfrac - 0.5) / 0.5;
+      const n = Math.random() < intensity ? 1 + ((Math.random() * 2) | 0) : 0;
+      for (let k = 0; k < n; k++) {
+        _sparkPos.set((Math.random() - 0.5) * 0.42, 0.03, -0.42 - Math.random() * 0.12);
+        m.localToWorld(_sparkPos);
+        sparks.emit(_sparkPos, _sparkBack, _sparkSide, sfrac);
+      }
+    }
+  }
   let skidNow = false, skidHeavy = false;
   if (raceState === 'racing' && playerCar) {
     const pc = playerCar;
